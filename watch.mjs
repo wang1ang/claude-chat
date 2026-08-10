@@ -1,15 +1,93 @@
 // claude-chat 的电脑端跟看（Ink/TUI 版）：连本地轮询接口，把事件渲染成
 // 「上方内容区滚动 + 底部固定输入框」的界面——生成中也能打字、退格删整个汉字、
-// 上/下箭头翻历史，长段落自动折行由 Ink 负责，不再手搓光标序列。
+// 上/下箭头翻历史、Option/Alt+←/→ 按单词跳，长段落自动折行由 Ink 负责，不再手搓光标序列。
 // 用法（由 claude-chat 调用）：PORT=.. SECRET=.. [FULL_URL=..] [PID_FILE=..] node watch.mjs
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, Static, useApp, useInput, useStdout } from "ink";
-import TextInput from "ink-text-input";
 import htm from "htm";
 
 const html = htm.bind(React.createElement);
+
+// ── 自带的单行输入框（替掉 ink-text-input）──────────────────────────────────
+// 为什么自己写：ink-text-input 把光标 offset 藏在内部 state 里、不暴露，没法从外部
+// 实现「按单词跳」；且它对 meta+箭头/Option+f/b 一概不认。这里全盘接管，光标以
+// **码点**为单位（和退格删整个汉字一致），并支持 macOS 的 Option/Alt 词跳。
+// 注意：不吞 ↑/↓（留给父组件翻历史）和 Ctrl-C（留给父组件中断/退出）。
+const isWordChar = (ch) => !!ch && !/\s/.test(ch);
+// 从 cursor 往左找上一个「词首」的码点下标。
+function wordLeft(cps, cursor) {
+  let i = cursor;
+  while (i > 0 && !isWordChar(cps[i - 1])) i--;   // 先跳过左侧空白
+  while (i > 0 && isWordChar(cps[i - 1])) i--;     // 再跳过整个词
+  return i;
+}
+// 从 cursor 往右找下一个「词尾之后」的码点下标。
+function wordRight(cps, cursor) {
+  const n = cps.length;
+  let i = cursor;
+  while (i < n && !isWordChar(cps[i])) i++;        // 跳过右侧空白
+  while (i < n && isWordChar(cps[i])) i++;          // 跳过整个词
+  return i;
+}
+
+function Input({ value, onChange, onSubmit, focus = true }) {
+  const cps = [...value];                          // 按码点切，索引即光标位置
+  const [cursor, setCursor] = useState(cps.length);
+  const cur = Math.max(0, Math.min(cursor, cps.length));
+
+  const setBoth = (nextCps, nextCursor) => {
+    setCursor(nextCursor);
+    onChange(nextCps.join(""));
+  };
+
+  useInput((input, key) => {
+    // 交回父组件处理的键：不动、直接放行。
+    if (key.upArrow || key.downArrow || (key.ctrl && input === "c")) return;
+
+    if (key.return) { onSubmit?.(value); return; }
+
+    // Option/Alt 词跳：macOS 默认 Option+←/→ 发 ESC b / ESC f（input=b/f + meta），
+    // iTerm「Esc+」模式发 ESC[1;3D/C（leftArrow/rightArrow + meta）。两种都认。
+    const metaWord = key.meta && (key.leftArrow || key.rightArrow || input === "b" || input === "f");
+    if (metaWord) {
+      if (key.leftArrow || input === "b") setCursor(wordLeft(cps, cur));
+      else setCursor(wordRight(cps, cur));
+      return;
+    }
+    // Option+Delete = 删掉左边一个词（macOS 习惯）
+    if (key.meta && (key.backspace || key.delete)) {
+      const from = wordLeft(cps, cur);
+      setBoth([...cps.slice(0, from), ...cps.slice(cur)], from);
+      return;
+    }
+    // Ctrl-A / Ctrl-E：跳行首 / 行尾（顺手支持，几乎零成本）
+    if (key.ctrl && input === "a") { setCursor(0); return; }
+    if (key.ctrl && input === "e") { setCursor(cps.length); return; }
+
+    if (key.leftArrow) { setCursor(Math.max(0, cur - 1)); return; }
+    if (key.rightArrow) { setCursor(Math.min(cps.length, cur + 1)); return; }
+
+    if (key.backspace || key.delete) {
+      if (cur > 0) setBoth([...cps.slice(0, cur - 1), ...cps.slice(cur)], cur - 1);
+      return;
+    }
+
+    // 其余当作可打印文本插到光标处（含中文/粘贴的多字符）。
+    // 过滤掉落单的控制字符（未被上面识别的转义序列残余），别把乱码塞进输入。
+    if (input && !key.ctrl && !key.meta) {
+      const ins = [...input].filter((c) => c >= " " || c === "\t");
+      if (ins.length) setBoth([...cps.slice(0, cur), ...ins, ...cps.slice(cur)], cur + ins.length);
+    }
+  }, { isActive: focus });
+
+  // 反显一个假光标（和 ink-text-input 一样的做法，但按码点渲染）。
+  const before = cps.slice(0, cur).join("");
+  const atChar = cur < cps.length ? cps[cur] : " ";
+  const after = cur < cps.length ? cps.slice(cur + 1).join("") : "";
+  return html`<${Text}>${before}<${Text} inverse>${atChar}<//>${after}<//>`;
+}
 
 const PORT = process.env.PORT;
 const SECRET = process.env.SECRET;
@@ -293,7 +371,7 @@ function App() {
       ${status ? html`<${Box}><${Text} color="gray">… ${status}<//><//>` : null}
       <${Box}>
         <${Text} color="green" bold>你 ▸ <//>
-        <${TextInput} value=${input} onChange=${setInput} onSubmit=${onSubmit} placeholder="" />
+        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} />
       <//>
     <//>
   `;
