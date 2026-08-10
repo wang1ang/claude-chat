@@ -13,6 +13,8 @@
   header { padding:10px 14px; background:var(--panel); border-bottom:1px solid #30363d;
     font-size:14px; color:var(--muted); display:flex; justify-content:space-between; align-items:center; }
   header b { color:var(--text); }
+  #conn { cursor:pointer; user-select:none; }
+  #conn:active { opacity:.6; }
   #log { flex:1; overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
   .bubble { position:relative; max-width:88%; padding:10px 13px; border-radius:14px; white-space:pre-wrap;
     word-break:break-word; overflow-wrap:anywhere;
@@ -38,7 +40,7 @@
 </head>
 <body>
 <div id="app">
-  <header><span>💬 <b>claude-chat</b> <small style="color:#6e7681">·长按气泡复制</small></span><span id="conn">连接中…</span></header>
+  <header><span>💬 <b>claude-chat</b> <small style="color:#6e7681">·长按气泡复制</small></span><span id="conn" title="点我刷新到最新">连接中…</span></header>
   <div id="log"></div>
   <form id="f">
     <textarea id="t" rows="1" placeholder="发消息给 Claude…" autocomplete="off"></textarea>
@@ -193,6 +195,9 @@ connect();
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && (!es || es.readyState === 2)) connect();
 });
+// 点右上角状态 = 手动刷新：重连 SSE 会让服务端重读 jsonl，把电脑上写进去的最新对话铺出来。
+// （claude-chat 只在连接那一刻读一次历史；电脑 CLI 后续写的新内容，靠这个刷新拉过来。）
+conn.addEventListener('click', () => { conn.textContent = '刷新中…'; connect(); });
 
 async function send() {
   const text = ta.value.trim();
