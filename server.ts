@@ -132,6 +132,7 @@ async function runPrompt(prompt: string) {
     return;
   }
   running = true;
+  if (process.env.CC_DEBUG) console.error(`[runPrompt] prompt=${JSON.stringify(prompt)} resume=${SESSION_ID ?? "(新)"}`);
   broadcast({ type: "user", text: prompt });      // 回显用户气泡
   broadcast({ type: "status", text: "思考中…" });
 
@@ -154,6 +155,12 @@ async function runPrompt(prompt: string) {
     });
 
     for await (const message of iter) {
+      if (process.env.CC_DEBUG) {
+        let d = "";
+        if (message.type === "assistant") d = JSON.stringify((message as any).message?.content)?.slice(0, 120);
+        else if (message.type === "result") d = (message as any).subtype;
+        console.error(`[msg] ${message.type}${(message as any).subtype ? "/" + (message as any).subtype : ""} ${d}`);
+      }
       if (message.type === "system" && message.subtype === "init") {
         SESSION_ID = message.session_id;            // 记住会话，后续接着聊
         broadcast({ type: "session", sessionId: SESSION_ID });
