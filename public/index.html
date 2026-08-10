@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>claude-chat</title>
 <style>
   :root { --bg:#0d1117; --panel:#161b22; --me:#238636; --ai:#21262d; --tool:#1f2a44; --text:#e6edf3; --muted:#8b949e; }
@@ -31,8 +31,11 @@
   .ai pre, .ai code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   form { display:flex; gap:8px; padding:10px; background:var(--panel); border-top:1px solid #30363d;
     padding-bottom:calc(10px + env(safe-area-inset-bottom)); }
+  /* font-size 必须 ≥16px：iOS Safari 聚焦小于 16px 的输入框会自动放大页面，把发送按钮顶出视野。
+     用 font: ...inherit 时计算值可能被继承成非 16px，这里显式写死 16px 杜绝放大。 */
   textarea { flex:1; resize:none; border:1px solid #30363d; border-radius:10px; background:var(--bg);
-    color:var(--text); padding:10px 12px; font:16px/1.4 inherit; max-height:120px; }
+    color:var(--text); padding:10px 12px; font-size:16px; line-height:1.4;
+    font-family:inherit; max-height:120px; }
   button { border:0; border-radius:10px; background:var(--me); color:#fff; padding:0 18px;
     font-size:16px; font-weight:600; }
   button:disabled { opacity:.4; }
