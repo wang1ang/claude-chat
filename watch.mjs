@@ -1,7 +1,9 @@
-// claude-chat 的电脑端只读跟看：连本地 SSE，把事件 pretty-print 到终端。
+// claude-chat 的电脑端跟看：连本地轮询接口，把事件 pretty-print 到终端；
+// 还能直接在终端打字发消息（跟手机同一个 /send 接口），方便调试。
 // 用法（由 claude-chat-watch 调用）：PORT=.. SECRET=.. node watch.mjs
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 const PORT = process.env.PORT;
 const SECRET = process.env.SECRET;
 const FULL_URL = process.env.FULL_URL || "";
@@ -106,6 +108,17 @@ let lastSigint = 0;
 async function postInterrupt() {
   try { await fetch(`http://127.0.0.1:${PORT}/${SECRET}/interrupt`, { method: "POST" }); } catch {}
 }
+async function postSend(text) {
+  try {
+    await fetch(`http://127.0.0.1:${PORT}/${SECRET}/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) {
+    console.log(`${C.red}   ⚠️ 发送失败：${e.message}${C.reset}`);
+  }
+}
 function shutdownAll() {
   // 1) kill pid 文件里记录的父进程（连同进程组）
   try {
@@ -133,6 +146,17 @@ process.on("SIGINT", () => {
   postInterrupt();
 });
 
-console.log(`${C.dim}claude-chat 跟看中（只读）。Ctrl-C 中断当前生成；连按两次退出并全关。${C.reset}`);
+console.log(`${C.dim}claude-chat 跟看中。直接打字回车发消息；Ctrl-C 中断当前生成，连按两次退出并全关。${C.reset}`);
 printUrl();   // 一进来先钉一遍网址（不再依赖 SSE 的 hello 事件；历史铺完 history_end 还会再钉）
 connect();
+
+// 终端输入：整行读，回车即发（跟手机同一个 /send）。空行忽略。
+// 不设 raw mode、不接管 readline 的 SIGINT，Ctrl-C 仍走上面的 process.on("SIGINT") 双击逻辑。
+const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+rl.on("line", (line) => {
+  const text = line.trim();
+  if (!text) return;
+  // 不在本地回显——server 会 broadcast 一个 user 事件，轮询拉回来由 render 统一显示，
+  // 避免同一句话打印两次。
+  postSend(text);
+});
