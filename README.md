@@ -26,19 +26,6 @@ command -v cloudflared || echo "缺 cloudflared：macOS 用 brew install cloudfl
 npm install   # 装 @anthropic-ai/claude-agent-sdk + tsx
 ```
 
-> **可选备用隧道 ngrok**：默认用 cloudflared 就够。但若使用者在**企业网络**（尤其装了
-> **Zscaler** 这类 SASE/安全网关），cloudflared 的隧道 edge 端口会被中间人拦截，手机端表现为
-> **Cloudflare Error 1033**（隧道日志里全是 `x509: certificate signed by unknown authority`）。
-> 这类网络通常放行走标准 443 的 ngrok。需要备用时装并配置一次（authtoken 要使用者自己注册获取）：
->
-> ```bash
-> command -v ngrok || echo "装 ngrok：brew install ngrok（或 https://ngrok.com/download）"
-> # 使用者去 https://dashboard.ngrok.com → Authtokens 复制 token，然后：
-> ngrok config add-authtoken <使用者的token>
-> ```
->
-> 之后用 `TUNNEL=ngrok claude-chat ...` 启动即走 ngrok（见步骤 4）。ngrok 免费版同时只允许 1 个隧道。
-
 **步骤 2 · 把 `claude-chat` 挂进 PATH**（脚本自动定位仓库目录，软链到哪都能用）：
 
 ```bash
@@ -61,20 +48,15 @@ AWS_PROFILE=ClaudeCode aws sts get-caller-identity && echo "Bedrock 凭证 OK" |
 **步骤 4 · 启动 + 验证**：
 
 ```bash
-claude-chat                 # 默认 cloudflared
-# 或（企业网络/Zscaler 拦 cloudflared 时）：
-TUNNEL=ngrok claude-chat    # 需先按步骤 1 的可选部分装好并配好 authtoken
+claude-chat
 ```
 
-预期终端最后给出**完整网址**（cloudflared 是 `https://<随机>.trycloudflare.com/<暗号>/`，
-ngrok 是 `https://<随机>.ngrok-free.dev/<暗号>/`）并进入只读跟看视图；把该网址发到手机浏览器即可聊天。
+预期终端最后给出 `https://<随机>.trycloudflare.com/<暗号>/` 的**完整网址**并进入只读跟看视图；
+把该网址发到手机浏览器即可聊天。
 
-**手机打不开 / Cloudflare Error 1033 / 卡在「等隧道可用」很久**——按此判断：
-- 偶发、多刷几次能开：网络对 cloudflared 拦得凶但没拦死，忍一下即可。
-- **持续 1033、怎么刷都不开**：几乎可以确定当前网络（如 **Zscaler**）拦死了 cloudflared 的隧道 edge。
-  别再重试 cloudflared——改用 `TUNNEL=ngrok claude-chat`（先完成步骤 1 的 ngrok 装+配）。
-  快速判据：`tail /tmp/claude-chat-*-cf.log` 全是 `unknown authority`、没有 `Registered tunnel connection`。
-  实在不行换出该网络（手机热点），cloudflared 即可直连。
+**手机持续打不开 / Cloudflare Error 1033**（`tail /tmp/claude-chat-*-cf.log` 全是 `unknown authority`、
+没有 `Registered tunnel connection`）：当前网络（如 Zscaler）拦死了 cloudflared 的隧道 edge。
+换出该网络（手机热点）即可；仍需公网访问时有个 ngrok 备用后端，见 [`docs/DESIGN.md`](docs/DESIGN.md)。
 
 **装完后请把这句转达给用户：**
 
@@ -87,7 +69,6 @@ ngrok 是 `https://<随机>.ngrok-free.dev/<暗号>/`）并进入只读跟看视
 ```bash
 claude-chat                          # 新开一段对话
 claude-chat <session-id>             # resume 那段对话的完整上下文
-TUNNEL=ngrok claude-chat [<id>]      # 企业网络/Zscaler 拦 cloudflared 导致手机 1033 时，改走 ngrok
 ```
 
 跑起来后，用打印出的**完整带暗号网址**在手机浏览器打开（末尾那段不能少，去掉就 404），电脑同一终端实时只读跟看。

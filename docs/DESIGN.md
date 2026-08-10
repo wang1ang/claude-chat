@@ -35,6 +35,26 @@ Claude 进程 I/O 绑死在启动它的 TTY 上，没法被别的程序塞消息
 
 `bin/claude-chat` 里的 `APP_DIR` / `cloudflared` / `node` 都是自动探测的，换机不用改。
 
+## 隧道：默认 cloudflared，ngrok 作兜底
+
+默认用 cloudflared quick tunnel（QUIC，走 UDP/7844），无需账号，绝大多数网络能直连。
+**不要**给它写死 `--protocol http2`——那会走 TCP/443 TLS，撞上 Zscaler 这类 TLS 中间人后
+报 `x509: certificate signed by unknown authority`、隧道一次都连不上、手机 Cloudflare 1033。
+
+极少数网络连 QUIC 的 edge 也拦死时，有个 ngrok 备用后端（走标准 443，这类网关通常放行）。
+一次性装好并配 authtoken（token 自己去 <https://dashboard.ngrok.com> → Authtokens 领）：
+
+```bash
+command -v ngrok || brew install ngrok        # 或 https://ngrok.com/download
+ngrok config add-authtoken <你的token>
+```
+
+之后启动时加环境变量即走 ngrok（免费版同时只允许 1 个隧道）：
+
+```bash
+TUNNEL=ngrok claude-chat [<session-id>]
+```
+
 ## 后端认证（AWS Bedrock）
 
 `bin/claude-chat` 开头默认按 **AWS Bedrock** 准备并**强制重置**成干净的一套（防当前 shell 被别的
