@@ -62,9 +62,9 @@ function Input({ value, onChange, onSubmit, focus = true }) {
       setBoth([...cps.slice(0, from), ...cps.slice(cur)], from);
       return;
     }
-    // Ctrl-A / Ctrl-E：跳行首 / 行尾（顺手支持，几乎零成本）
-    if (key.ctrl && input === "a") { setCursor(0); return; }
-    if (key.ctrl && input === "e") { setCursor(cps.length); return; }
+    // 行首 / 行尾：Home、End，以及 Ctrl-A / Ctrl-E（顺手支持，几乎零成本）
+    if (key.home || (key.ctrl && input === "a")) { setCursor(0); return; }
+    if (key.end || (key.ctrl && input === "e")) { setCursor(cps.length); return; }
 
     if (key.leftArrow) { setCursor(Math.max(0, cur - 1)); return; }
     if (key.rightArrow) { setCursor(Math.min(cps.length, cur + 1)); return; }
