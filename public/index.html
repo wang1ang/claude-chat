@@ -31,10 +31,11 @@
   .ai pre, .ai code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   form { display:flex; gap:8px; padding:10px; background:var(--panel); border-top:1px solid #30363d;
     padding-bottom:calc(10px + env(safe-area-inset-bottom)); }
-  /* font-size 必须 ≥16px：iOS Safari 聚焦小于 16px 的输入框会自动放大页面，把发送按钮顶出视野。
-     用 font: ...inherit 时计算值可能被继承成非 16px，这里显式写死 16px 杜绝放大。 */
+  /* iOS Safari 聚焦 <16px 的输入框会自动放大页面。已用 viewport 的 maximum-scale=1,
+     user-scalable=no 锁死缩放，所以这里可以用 14px（锁缩放后 iOS 不再触发聚焦放大）。
+     若个别 iOS 版本仍放大，把这里改回 16px 最稳。 */
   textarea { flex:1; resize:none; border:1px solid #30363d; border-radius:10px; background:var(--bg);
-    color:var(--text); padding:10px 12px; font-size:16px; line-height:1.4;
+    color:var(--text); padding:9px 12px; font-size:14px; line-height:1.4;
     font-family:inherit; max-height:120px; }
   button { border:0; border-radius:10px; background:var(--me); color:#fff; padding:0 18px;
     font-size:16px; font-weight:600; }
@@ -163,7 +164,10 @@ function handle(msg) {
   }
 }
 
-function setBusy(b) { btn.disabled = b; }
+// 生成中不再禁用发送按钮——要能像 CLI 那样随时插话。busy 只用来决定：
+// 生成中再发 = 先中断当前轮再发新消息（打断重说）。按钮文字随状态变，提示当前可打断。
+let busy = false;
+function setBusy(b) { busy = b; btn.textContent = b ? '打断' : '发送'; }
 
 // 关键：不靠"相对路径 + 尾斜杠"。手机地址栏可能吃掉末尾的 /，导致 EventSource('stream')
 // 掉了 /<secret> 前缀撞 404、SSE 根本连不上（发送成功但收不到回复）。
@@ -214,8 +218,15 @@ conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSe
 async function send() {
   const text = ta.value.trim();
   if (!text) return;
-  ta.value = ''; ta.style.height = 'auto'; setBusy(true);
+  ta.value = ''; ta.style.height = 'auto';
   try {
+    // 生成中发送 = 像 CLI 那样打断重说：先中断当前轮，略等它收尾，再发新消息。
+    // （server 单飞行，不先中断的话新消息会被「上一条还在处理」顶回。）
+    if (busy) {
+      try { await fetch(BASE + 'interrupt', { method:'POST' }); } catch {}
+      await new Promise(r => setTimeout(r, 400));
+    }
+    setBusy(true);
     await fetch(BASE + 'send', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ text }) });
   } catch { setBusy(false); addBubble('status','⚠️ 发送失败'); }
