@@ -41,13 +41,14 @@ ln -s "$PWD/bin/claude-chat" ~/.local/bin/claude-chat   # 确保 ~/.local/bin �
 # 或者直接 export PATH="$PWD/bin:$PATH"
 ```
 
-**换机必改**：`bin/claude-chat` 开头有两行按作者本机写死的路径，clone 到别的机器后要改成你自己的：
+**换机可能要改**：`bin/claude-chat` 开头几行：
 
 ```sh
-APP_DIR=/Users/yang.wang/.local/claude-chat   # 改成你的项目目录，例：$HOME/models/claude-chat
-CFD=/opt/homebrew/bin/cloudflared             # 改成 `which cloudflared` 的结果
+APP_DIR="${CLAUDE_CHAT_DIR:-${0:A:h:h}}"   # 默认取脚本所在仓库根，一般不用改
+CFD=/opt/homebrew/bin/cloudflared          # 改成 `which cloudflared` 的结果
 ```
 
+`APP_DIR` 默认自动定位到本仓库目录；如果你把脚本 symlink 到别处又想固定，可 `export CLAUDE_CHAT_DIR=/你的/路径` 或直接改写死。
 （`node`/`npx` 脚本会自己 `command -v` 找，不用改。AWS Bedrock 那段见下方「后端认证」。）
 
 验证：

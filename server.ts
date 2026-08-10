@@ -125,7 +125,7 @@ function ensureHistoryLoaded() {
 
 // ---- 读取会话历史（.jsonl），转成一串可直接渲染的气泡事件 ----
 // Claude Code 把历史存在 ~/.claude/projects/<slug>/<session-id>.jsonl，
-// slug 是把项目目录路径里的 "/" 和 "." 都换成 "-"（例：/Users/yang.wang → -Users-yang-wang）。
+// slug 是把项目目录路径里的 "/" 和 "." 都换成 "-"（例：/home/alice/proj → -home-alice-proj）。
 function slugForCwd(cwd: string): string {
   return cwd.replace(/[/.]/g, "-");
 }

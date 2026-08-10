@@ -9,15 +9,18 @@
 
 set -e
 
-APP_DIR=/Users/yang.wang/.local/claude-chat
+# 项目目录：默认取本脚本（bin/claude-chat）所在仓库根。
+# 若你把脚本 symlink 到别处，用 CLAUDE_CHAT_DIR 覆盖，或直接改成绝对路径。
+APP_DIR="${CLAUDE_CHAT_DIR:-${0:A:h:h}}"   # 脚本绝对路径的上两级（bin/ 的父目录=仓库根）
 CFD=/opt/homebrew/bin/cloudflared
 NODE=$(command -v node)
 NPX=$(command -v npx)
 BASE_PORT=8790
 
-# ── Bedrock 环境：强制重置成干净的那套（等价于 .zshrc 里的 pi-env alias）。
-# 当前 shell 可能被 spaas kubernetes configure 污染成 tokyo/静态 key，会顶掉 credential_process
-# 自动刷新，导致后台 claude 调 Bedrock 被"AWS 认证"拦住。这里显式修正后再传给 server。
+# ── Bedrock 环境：强制重置成干净的那套。
+# 当前 shell 可能被其他工具改过 AWS 环境变量（静态 key / 别的 region），会顶掉
+# credential_process 自动刷新，导致后台 claude 调 Bedrock 被"AWS 认证"拦住。
+# 这里显式修正后再传给 server。改成你自己的登录态即可（见 README「后端认证」）。
 export CLAUDE_CODE_USE_BEDROCK=1
 export AWS_PROFILE=ClaudeCode
 export AWS_REGION=us-west-2
