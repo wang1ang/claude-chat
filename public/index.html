@@ -169,14 +169,30 @@ const BASE = (() => {
   return location.origin + p;   // 例：https://host/<secret>/
 })();
 
-// SSE：断了自动重连
+// SSE：断了主动重连（不完全依赖 EventSource 自带的重连——手机锁屏/切后台/隧道换端口时
+// 它常卡在半死状态不自愈）。出错就关掉旧的、退避重连；切回前台立即重连。
+let es = null, reconnectTimer = null, backoff = 1000;
 function connect() {
-  const es = new EventSource(BASE + 'stream');
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (es) { try { es.close(); } catch {} }
+  es = new EventSource(BASE + 'stream');
   es.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch {} };
-  es.onerror = () => { conn.textContent = '断开·重连中…'; };
-  es.onopen = () => { conn.textContent = '已连接'; };
+  es.onopen = () => { conn.textContent = '已连接'; backoff = 1000; };
+  es.onerror = () => {
+    conn.textContent = '断开·重连中…';
+    try { es.close(); } catch {}
+    // 自己退避重连（1s→2s→…→最多 10s），别让它对着死连接空转
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, backoff);
+      backoff = Math.min(backoff * 2, 10000);
+    }
+  };
 }
 connect();
+// 手机从后台/锁屏切回来时，连接多半已死——立即重连拉最新历史
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && (!es || es.readyState === 2)) connect();
+});
 
 async function send() {
   const text = ta.value.trim();

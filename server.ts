@@ -108,6 +108,8 @@ async function runPrompt(prompt: string) {
 
   const abort = new AbortController();
   currentAbort = abort;
+  let streamedText = false;   // 这一轮有没有通过 stream_event 实时吐过文字
+  let sentDone = false;       // result 是否已发过 done（避免 finally 重复发）
   try {
     const iter = query({
       prompt,
@@ -134,6 +136,7 @@ async function runPrompt(prompt: string) {
         } else if (ev.type === "content_block_delta") {
           if (ev.delta?.type === "text_delta") {
             broadcast({ type: "text_delta", text: ev.delta.text });
+            streamedText = true;
           } else if (ev.delta?.type === "input_json_delta") {
             broadcast({ type: "tool_input_delta", partial: ev.delta.partial_json });
           }
@@ -141,8 +144,30 @@ async function runPrompt(prompt: string) {
           broadcast({ type: "block_stop" });
         }
 
+      } else if (message.type === "assistant") {
+        // 兜底：有些回复不走 token 级 stream_event（尤其短回复/某些路径），
+        // 只来一条完整的 assistant 消息。若这一轮没实时吐过文字，就从这里把文字/工具补发出去，
+        // 否则手机端会从"思考中"直接跳到"完成"、看不到任何回复。
+        if (!streamedText) {
+          const content: any = (message as any).message?.content;
+          if (Array.isArray(content)) {
+            for (const b of content) {
+              if (b?.type === "text" && b.text) {
+                broadcast({ type: "text_delta", text: b.text });
+                broadcast({ type: "block_stop" });
+              } else if (b?.type === "tool_use") {
+                broadcast({ type: "tool_start", name: b.name });
+              }
+            }
+          } else if (typeof content === "string" && content) {
+            broadcast({ type: "text_delta", text: content });
+            broadcast({ type: "block_stop" });
+          }
+        }
+
       } else if (message.type === "result") {
         broadcast({ type: "done", subtype: message.subtype, sessionId: message.session_id });
+        sentDone = true;
         SESSION_ID = message.session_id;
       }
     }
@@ -153,7 +178,8 @@ async function runPrompt(prompt: string) {
   } finally {
     running = false;
     if (currentAbort === abort) currentAbort = null;
-    broadcast({ type: "done", subtype: "idle" });   // 让前端解除 busy
+    // 只有 result 没发过 done 时（中断/报错/异常提前退出）才补一个，避免重复"✓ 完成"
+    if (!sentDone) broadcast({ type: "done", subtype: "idle" });
   }
 }
 
