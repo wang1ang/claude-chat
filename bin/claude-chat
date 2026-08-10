@@ -83,8 +83,10 @@ if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/$SECRET/"; then
 fi
 
 # 2) 后台起 cloudflared 隧道
+# --protocol http2：很多公司网络禁了出站 UDP(7844)，默认的 QUIC 握手会一直超时重连、
+# 迟迟打印不出网址。强制走 http2 就绕开了（cloudflared 自己 precheck 也会建议这么做）。
 : > "$CF_LOG"
-nohup "$CFD" tunnel --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
+nohup "$CFD" tunnel --protocol http2 --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
 echo $! >> "$PID_FILE"
 
 # 3) 抓公开网址
