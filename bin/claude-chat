@@ -131,9 +131,11 @@ if [ "$TUNNEL" = "ngrok" ]; then
     echo -n "."; sleep 1
   done
 else
-  # cloudflared。--protocol http2：很多公司网络禁了出站 UDP(7844)，默认 QUIC 握手会一直
-  # 超时重连、迟迟打不出网址。强制走 http2 绕开（cloudflared precheck 也会这么建议）。
-  nohup "$CFD" tunnel --protocol http2 --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
+  # cloudflared。用默认协议（QUIC，走 UDP/7844），别强制 http2：
+  # http2 走 TCP/443 TLS，会撞上 Zscaler 这类 TLS 中间人 → 假证书 →
+  # `x509: unknown authority` → 隧道一次都连不上、手机 1033。QUIC 通常绕过中间人。
+  # 真遇到禁 UDP 出站的网络，cloudflared precheck 会自己回退，不用我们写死。
+  nohup "$CFD" tunnel --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
   echo $! >> "$PID_FILE"
   echo -n "正在建立隧道"
   for i in {1..40}; do
