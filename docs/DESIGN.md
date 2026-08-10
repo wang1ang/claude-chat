@@ -54,6 +54,29 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 **改成你自己的登录态**：如果你不用 Bedrock，把上面这段删掉/替换成你的方式即可
 （Agent SDK 支持标准 Anthropic 登录态 / API key，例如 `export ANTHROPIC_API_KEY=...`）。
 
+## 使用细节
+
+命令行：
+
+```bash
+claude-chat                          # 新开一段对话
+claude-chat <session-id>             # resume 那段对话的完整上下文（含历史回放）
+claude-chat --resume <session-id>    # 同上（兼容写法）
+claude-chat --model <model> <id>     # 指定模型（可选）
+```
+
+`Ctrl-C` 一次 = 中断当前这一轮生成；**1.5 秒内连按两次** = 退出跟看并全关服务+隧道。
+
+**发消息交互**（手机 & 终端一致）：
+
+- **输入框有文字**发送 = **排队插入**：排到当前这轮之后，跑完自动接着处理（贴近 CLI，不打断）。
+- **输入框为空**发送（手机点发送 / 终端空行回车）= **打断**：掐断当前这轮 + 清空还没跑的排队。
+- 手机发送按钮文案兼当忙闲指示：**空闲显示「发送」**（这轮说完了）、在跑时显示「排队」或「打断」。
+- 手机往前滑到顶自动加载更早的历史消息。
+
+会话默认绑你运行 `claude-chat` 时所在目录当 cwd（想指定：`CHAT_CWD=/path claude-chat <id>`），
+历史存在 `~/.claude/projects/<slug>/<session-id>.jsonl`；resume 时先铺历史再接着实时对话。
+
 ## ⚠️ 安全
 
 **MVP 阶段工具全自动允许**：`server.ts` 里用 `canUseTool` 回调对所有工具返回 `allow`
