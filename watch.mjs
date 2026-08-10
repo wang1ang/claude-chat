@@ -4,6 +4,8 @@
 // 用法（由 claude-chat 调用）：PORT=.. SECRET=.. [FULL_URL=..] [PID_FILE=..] node watch.mjs
 import { execSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, Static, useApp, useInput, useStdout, useCursor } from "ink";
 import stringWidth from "string-width";
@@ -167,11 +169,20 @@ function shutdownAll() {
       if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} }
     }
   } catch {}
-  // 2) 兜底按名清这一份的 server + cloudflared
+  // 2) 兜底按名清 server + 隧道。
+  // 为什么 server 还得按名兜：pid 文件里记的是 nohup 起的**顶层 npm exec** pid，
+  // 其下 npm→tsx→node(server.ts) 三层同属一个进程组，但 npm exec 未必把 SIGTERM
+  // 转发给子进程——只杀顶层，真正 listen 的 node(server.ts) 可能变孤儿继续占端口。
+  // 又不能按进程组杀：本 watch 进程和 server 同组（脚本 exec 成 watch），会自杀。
+  // 所以按**本仓库的 server.ts 绝对路径**兜——只命中本份，不会误伤别处装的另一实例
+  //（早先宽泛的 /claude-chat/server.ts 会连 ~/.local 那份一起杀，留别份隧道成孤儿→502）。
   const kill = (pat) => { try { execSync(`pkill -f ${JSON.stringify(pat)}`, { stdio: "ignore" }); } catch {} };
-  kill(`/claude-chat/server.ts`);
-  // 注意：这里的模式要和启动脚本一致（含 --protocol http2），否则 pkill 匹配不到、隧道成孤儿。
+  kill(`${dirname(fileURLToPath(import.meta.url))}/server.ts`);
+  // 隧道两种后端都兜（哪种在跑就命中哪种，另一种匹配不到、无副作用）。都按**本份端口**精确匹配。
+  // cloudflared：命令行带 --url http://127.0.0.1:<端口>，模式要和启动脚本一致（含 --protocol http2）。
   kill(`cloudflared tunnel --protocol http2 --url http://127.0.0.1:${PORT}`);
+  // ngrok：命令行是 `ngrok http <端口> ...`，用 http <端口> 精确到本份（词末空格防 8791 前缀误伤别份）。
+  kill(`ngrok http ${PORT} `);
   // 3) 删掉自己的 pid 文件，别在 /tmp 里越堆越多（启动脚本按它占用来选端口号）。
   try { unlinkSync(PID_FILE); } catch {}
 }

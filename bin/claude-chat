@@ -12,16 +12,35 @@ set -e
 # 项目目录：默认取本脚本（bin/claude-chat）所在仓库根。
 # 若你把脚本 symlink 到别处，用 CLAUDE_CHAT_DIR 覆盖，或直接改成绝对路径。
 APP_DIR="${CLAUDE_CHAT_DIR:-${0:A:h:h}}"   # 脚本绝对路径的上两级（bin/ 的父目录=仓库根）
-CFD=$(command -v cloudflared)              # 自动找 cloudflared（brew/apt/手装都行）
 NODE=$(command -v node)
 NPX=$(command -v npx)
 BASE_PORT=8790
 
-if [ -z "$CFD" ]; then
-  echo "❌ 没找到 cloudflared。装一下："
-  echo "     macOS:  brew install cloudflared"
-  echo "     Linux:  见 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
-  exit 1
+# 隧道后端：默认 cloudflared；TUNNEL=ngrok 走 ngrok。
+# 为什么给这个开关：某些企业网络（如 Zscaler）会中间人拦截 cloudflared 的隧道 edge
+# 端口（*.v2.argotunnel.com:7844），返回假证书 → cloudflared 一直握手失败、手机 1033。
+# ngrok 走标准 443，这类网关通常放行。脱离该网络（手机热点）时 cloudflared 也能用。
+TUNNEL="${TUNNEL:-cloudflared}"
+CFD=$(command -v cloudflared)
+NGROK=$(command -v ngrok)
+
+if [ "$TUNNEL" = "ngrok" ]; then
+  if [ -z "$NGROK" ]; then
+    echo "❌ 没找到 ngrok。装 + 配一次性："
+    echo "     brew install ngrok/ngrok/ngrok      # 或 https://ngrok.com/download"
+    echo "     ngrok config add-authtoken <你的token>   # 注册 https://dashboard.ngrok.com 后复制"
+    exit 1
+  fi
+elif [ "$TUNNEL" = "cloudflared" ]; then
+  if [ -z "$CFD" ]; then
+    echo "❌ 没找到 cloudflared。装一下："
+    echo "     macOS:  brew install cloudflared"
+    echo "     Linux:  见 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+    echo "   （企业网络拦 cloudflared 时可改用：TUNNEL=ngrok claude-chat ...）"
+    exit 1
+  fi
+else
+  echo "❌ TUNNEL 只支持 cloudflared 或 ngrok，收到：$TUNNEL"; exit 1
 fi
 if [ -z "$NODE" ] || [ -z "$NPX" ]; then
   echo "❌ 没找到 node/npx，先装 Node.js 18+（https://nodejs.org 或 brew install node）。"; exit 1
@@ -95,24 +114,39 @@ if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/$SECRET/"; then
   echo "❌ 本地服务没起来，看日志：$SRV_LOG"; tail -20 "$SRV_LOG"; exit 1
 fi
 
-# 2) 后台起 cloudflared 隧道
-# --protocol http2：很多公司网络禁了出站 UDP(7844)，默认的 QUIC 握手会一直超时重连、
-# 迟迟打印不出网址。强制走 http2 就绕开了（cloudflared 自己 precheck 也会建议这么做）。
+# 2) 后台起隧道（按 TUNNEL 选 cloudflared 或 ngrok）
 : > "$CF_LOG"
-nohup "$CFD" tunnel --protocol http2 --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
-echo $! >> "$PID_FILE"
-
-# 3) 抓公开网址
-echo -n "正在建立隧道"
 URL=""
-for i in {1..40}; do
-  URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -1)
-  [ -n "$URL" ] && break
-  echo -n "."; sleep 1
-done
+if [ "$TUNNEL" = "ngrok" ]; then
+  # ngrok：--log 落到 CF_LOG（统一日志名，清理/看日志逻辑不变），网址直接从日志 grep。
+  # 注意：ngrok 免费版同时只允许 1 个 agent session（本地 web 界面固定占 4040），
+  # 所以 ngrok 模式下多份并存跑不起来（第二份会因 session/4040 冲突失败）——够用即可。
+  nohup "$NGROK" http "$PORT" --log "$CF_LOG" --log-format logfmt >/dev/null 2>&1 &
+  echo $! >> "$PID_FILE"
+  echo -n "正在建立隧道(ngrok)"
+  for i in {1..40}; do
+    # 日志里 `started tunnel ... url=https://xxx.ngrok-free.dev`。
+    URL=$(grep -oE 'https://[a-z0-9-]+\.ngrok[-a-z.]*\.(app|io|dev)' "$CF_LOG" | head -1)
+    [ -n "$URL" ] && break
+    echo -n "."; sleep 1
+  done
+else
+  # cloudflared。--protocol http2：很多公司网络禁了出站 UDP(7844)，默认 QUIC 握手会一直
+  # 超时重连、迟迟打不出网址。强制走 http2 绕开（cloudflared precheck 也会这么建议）。
+  nohup "$CFD" tunnel --protocol http2 --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
+  echo $! >> "$PID_FILE"
+  echo -n "正在建立隧道"
+  for i in {1..40}; do
+    URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -1)
+    [ -n "$URL" ] && break
+    echo -n "."; sleep 1
+  done
+fi
 echo ""
 if [ -z "$URL" ]; then
-  echo "❌ 没拿到隧道网址，看日志：$CF_LOG"; exit 1
+  echo "❌ 没拿到隧道网址，看日志：$CF_LOG"
+  [ "$TUNNEL" = "ngrok" ] && echo "   ngrok 常见原因：没配 authtoken → ngrok config add-authtoken <token>"
+  exit 1
 fi
 
 # 暗号防护做在 Node 服务里：完整网址带 /<暗号>/ 前缀，根路径 404。
