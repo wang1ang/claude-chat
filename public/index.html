@@ -27,6 +27,12 @@
   .ai { align-self:flex-start; background:var(--ai); border-bottom-left-radius:4px; }
   .tool { align-self:flex-start; background:var(--tool); color:#a9c7ff; font-size:14px;
     border-radius:10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .tool-title { word-break:break-word; overflow-wrap:anywhere; }
+  .tool-title.tappable { cursor:pointer; }
+  .tool-title.tappable::before { content:'▸ '; color:#6e7681; }
+  .tool-detail { margin:8px 0 0; padding:8px; background:#0d1117; border-radius:8px;
+    font-size:12px; line-height:1.4; color:#c9d1d9; white-space:pre-wrap; word-break:break-word;
+    overflow-wrap:anywhere; max-height:40vh; overflow-y:auto; }
   .status { align-self:center; color:var(--muted); font-size:13px; }
   .ai pre, .ai code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   form { display:flex; gap:8px; padding:10px; background:var(--panel); border-top:1px solid #30363d;
@@ -60,6 +66,10 @@ const btn = document.getElementById('b');
 
 let aiBubble = null;      // 当前正在追加文本的 AI 气泡
 let statusEl = null;      // "思考中…" 之类
+// tool_start 立占位气泡入队；tool_use（同名，FIFO）来时取队首更新。
+// 为什么用队列：一轮里可能连开多个工具，stream 先一串 tool_start，
+// 完整参数随后由 assistant 消息一次性发一串 tool_use——按名字先进先出配对最稳。
+let toolPending = [];
 
 function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
 function scroll() { log.scrollTop = log.scrollHeight; }
@@ -74,6 +84,35 @@ function addBubble(cls, text='') {
   return d;
 }
 function clearStatus() { if (statusEl) { statusEl.remove(); statusEl = null; } }
+
+// 渲染一条完整工具调用：标题行「🔧 工具名 · 摘要」+ 可点开的完整参数（JSON）。
+// bubble 传 tool_start 立的占位就复用它（更新内容），传 null 就新建一条。
+function renderTool(bubble, msg) {
+  const stick = atBottom();
+  const el = bubble || (() => { const d = document.createElement('div'); d.className = 'bubble tool'; log.appendChild(d); return d; })();
+  el.textContent = '';                       // 清掉占位的 "… "
+  const title = document.createElement('div');
+  title.className = 'tool-title';
+  title.textContent = '🔧 ' + msg.name + (msg.summary ? ' · ' + msg.summary : '');
+  el.appendChild(title);
+  // 有参数就挂一个可点开的详情（默认收起，点标题切换）。
+  const input = msg.input && Object.keys(msg.input).length ? msg.input : null;
+  if (input) {
+    const detail = document.createElement('pre');
+    detail.className = 'tool-detail';
+    try { detail.textContent = JSON.stringify(input, null, 2); }
+    catch { detail.textContent = String(input); }
+    detail.style.display = 'none';
+    el.appendChild(detail);
+    title.classList.add('tappable');
+    title.addEventListener('click', () => {
+      detail.style.display = detail.style.display === 'none' ? 'block' : 'none';
+    });
+  }
+  enableCopy(el);
+  if (stick) scroll();
+  return el;
+}
 
 // 复制整条气泡内容到剪贴板，成功后短暂显示"已复制 ✓"
 async function copyBubble(el) {
@@ -99,6 +138,8 @@ async function copyBubble(el) {
 
 // 长按（触摸)或双击（桌面）复制整条；不影响手指拖动选择部分文本。
 function enableCopy(el) {
+  if (el._copyBound) return;   // 防重复绑定（工具气泡可能被 addBubble + renderTool 各绑一次）
+  el._copyBound = true;
   let timer = null, sx = 0, sy = 0, moved = false;
   el.addEventListener('touchstart', (e) => {
     moved = false;
@@ -123,7 +164,7 @@ function handle(msg) {
       break;
     case 'history_start':
       // 清空当前所有气泡，重新铺历史（防重连重复）
-      log.innerHTML = ''; aiBubble = null; statusEl = null;
+      log.innerHTML = ''; aiBubble = null; statusEl = null; toolPending = [];
       break;
     case 'ai':
       // 历史里的整条 AI 文字（不是增量）
@@ -143,9 +184,21 @@ function handle(msg) {
       statusEl = addBubble('status', msg.text);
       break;
     case 'tool_start':
+      // stream 里工具刚开始时参数还没到（input 是空的），先立一条占位气泡入队，
+      // 等下面的 tool_use（带完整参数+摘要）来更新它，避免出现两条重复的工具气泡。
       clearStatus(); aiBubble = null;
-      addBubble('tool', '🔧 ' + msg.name);
+      toolPending.push({ name: msg.name, el: addBubble('tool', '🔧 ' + msg.name + ' …') });
       break;
+    case 'tool_use': {
+      // 完整工具调用：有摘要 + 完整参数。按名字从占位队列取一个更新；
+      // 没有匹配占位（历史回放/兜底路径）就新建一条。
+      clearStatus(); aiBubble = null;
+      let bubble = null;
+      const idx = toolPending.findIndex(p => p.name === msg.name);
+      if (idx >= 0) { bubble = toolPending[idx].el; toolPending.splice(idx, 1); }
+      renderTool(bubble, msg);
+      break;
+    }
     case 'text_delta':
       clearStatus();
       if (!aiBubble) aiBubble = addBubble('ai', '');
@@ -155,7 +208,7 @@ function handle(msg) {
       aiBubble = null;      // 下一段文字另起气泡
       break;
     case 'done':
-      clearStatus(); aiBubble = null; setBusy(false);
+      clearStatus(); aiBubble = null; toolPending = []; setBusy(false);
       break;
     case 'error':
       clearStatus(); aiBubble = null; setBusy(false);
@@ -213,7 +266,7 @@ startPolling();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 // 点右上角状态 = 手动刷新：从头重拉一遍（重读 jsonl 历史 + 最新对话）。
 // 电脑 CLI 后续写进 jsonl 的新内容，靠这个从头拉过来。
-conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; poll(); });
+conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; toolPending=[]; poll(); });
 
 async function send() {
   const text = ta.value.trim();

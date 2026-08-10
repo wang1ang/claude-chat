@@ -55,8 +55,11 @@ function render(o) {
       if (!inHistory) console.log(`${C.gray}   … ${o.text}${C.reset}`);
       break;
     case "tool_start":
+      // stream 占位（参数还没到）——留给紧随其后的 tool_use 打详情，这里不再单独打一行避免重复。
+      break;
+    case "tool_use":
       endAI();
-      console.log(`${stamp()} ${C.yellow}🔧 ${o.name}${C.reset}`);
+      console.log(`${stamp()} ${C.yellow}🔧 ${o.name}${o.summary ? " " + C.dim + o.summary + C.reset : ""}${C.reset}`);
       break;
     case "text_delta":
       if (!aiOpen) { process.stdout.write(`${stamp()} ${C.cyan}${C.bold}Claude ◂${C.reset} `); aiOpen = true; }

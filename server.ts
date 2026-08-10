@@ -36,6 +36,40 @@ function broadcast(obj: any) {
   if (EVENTS.length > MAX_EVENTS) EVENTS.splice(0, EVENTS.length - MAX_EVENTS);
 }
 
+// 给工具调用生成一行人类可读摘要，手机上一眼看清"在干什么"。
+// 常见工具挑最能说明意图的字段；未知工具退化成截断的 JSON。
+function toolSummary(name: string, input: any): string {
+  const i = input ?? {};
+  const clip = (s: any, n = 80) => { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + "…" : s; };
+  const base = (p: any) => clip(String(p ?? "").split("/").pop());   // 只留文件名
+  try {
+    switch (name) {
+      case "Bash":        return clip(i.command, 120);
+      case "Read":        return "读 " + base(i.file_path);
+      case "Write":       return "写 " + base(i.file_path);
+      case "Edit":        return "改 " + base(i.file_path);
+      case "MultiEdit":   return "改 " + base(i.file_path) + `（${(i.edits?.length ?? 0)} 处）`;
+      case "Glob":        return "找文件 " + clip(i.pattern, 60);
+      case "Grep":        return "搜 " + clip(i.pattern, 60) + (i.path ? " @ " + base(i.path) : "");
+      case "LS":          return "列目录 " + base(i.path);
+      case "WebFetch":    return "抓网页 " + clip(i.url, 80);
+      case "WebSearch":   return "搜网 " + clip(i.query, 60);
+      case "Task":        return "子任务 " + clip(i.description || i.subagent_type, 60);
+      case "TodoWrite":   return `更新待办（${(i.todos?.length ?? 0)} 项）`;
+      case "NotebookEdit":return "改 notebook " + base(i.notebook_path);
+      case "AskUserQuestion": {
+        const q = i.questions?.[0]?.question || i.question || "";
+        return "❓ 提问：" + clip(q, 100);
+      }
+      case "ExitPlanMode":return "提交计划待确认";
+      default: {
+        const s = JSON.stringify(i);
+        return clip(s, 100);
+      }
+    }
+  } catch { return name; }
+}
+
 // 取 seq 之后的所有事件（since=0 或负数=从头，含刚铺的历史）
 function eventsSince(since: number): Ev[] {
   if (since <= 0) return EVENTS.slice();
@@ -111,7 +145,9 @@ function readHistory(sessionId: string): any[] {
       if (Array.isArray(content)) {
         for (const b of content) {
           if (b?.type === "text" && b.text?.trim()) out.push({ type: "ai", text: b.text });
-          else if (b?.type === "tool_use") out.push({ type: "tool_start", name: b.name });
+          // 历史里的工具调用参数是完整的，直接发 tool_use（带摘要+完整参数），
+          // 前端能渲染成可展开卡片，跟实时那条一致（历史没有 tool_start 占位）。
+          else if (b?.type === "tool_use") out.push({ type: "tool_use", name: b.name, summary: toolSummary(b.name, b.input), input: b.input ?? {} });
           // thinking 块跳过
         }
       } else if (typeof content === "string" && content.trim()) {
@@ -167,38 +203,39 @@ async function runPrompt(prompt: string) {
 
       } else if (message.type === "stream_event") {
         const ev: any = message.event;
+        // 工具开始的即时提示：stream 里 content_block_start 时 input 还是空的（参数随后才 delta 出来），
+        // 所以这里只发一个"工具开始"占位；完整参数由下面的 assistant 消息补齐成 tool_use 详情。
         if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
           broadcast({ type: "tool_start", name: ev.content_block.name });
         } else if (ev.type === "content_block_delta") {
           if (ev.delta?.type === "text_delta") {
             broadcast({ type: "text_delta", text: ev.delta.text });
             streamedText = true;
-          } else if (ev.delta?.type === "input_json_delta") {
-            broadcast({ type: "tool_input_delta", partial: ev.delta.partial_json });
           }
+          // input_json_delta（工具参数分片）不再逐片发——手机端拼不起来也没意义；
+          // 完整参数走 assistant 消息一次性发出。
         } else if (ev.type === "content_block_stop") {
           broadcast({ type: "block_stop" });
         }
 
       } else if (message.type === "assistant") {
-        // 兜底：有些回复不走 token 级 stream_event（尤其短回复/某些路径），
-        // 只来一条完整的 assistant 消息。若这一轮没实时吐过文字，就从这里把文字/工具补发出去，
-        // 否则手机端会从"思考中"直接跳到"完成"、看不到任何回复。
-        if (!streamedText) {
-          const content: any = (message as any).message?.content;
-          if (Array.isArray(content)) {
-            for (const b of content) {
-              if (b?.type === "text" && b.text) {
-                broadcast({ type: "text_delta", text: b.text });
-                broadcast({ type: "block_stop" });
-              } else if (b?.type === "tool_use") {
-                broadcast({ type: "tool_start", name: b.name });
-              }
+        // assistant 消息里 tool_use 块的 input 是**完整**的——无论走没走 token 流，
+        // 都从这里把工具的完整参数发出去（带一行人类可读摘要），手机才看得到"在干什么"。
+        const content: any = (message as any).message?.content;
+        if (Array.isArray(content)) {
+          for (const b of content) {
+            if (b?.type === "tool_use") {
+              broadcast({ type: "tool_use", name: b.name, summary: toolSummary(b.name, b.input), input: b.input ?? {} });
+            } else if (!streamedText && b?.type === "text" && b.text) {
+              // 兜底：这一轮没走 token 流（短回复/某些路径），从完整消息补发文字，
+              // 否则手机端会从"思考中"直接跳到"完成"、看不到回复。
+              broadcast({ type: "text_delta", text: b.text });
+              broadcast({ type: "block_stop" });
             }
-          } else if (typeof content === "string" && content) {
-            broadcast({ type: "text_delta", text: content });
-            broadcast({ type: "block_stop" });
           }
+        } else if (!streamedText && typeof content === "string" && content) {
+          broadcast({ type: "text_delta", text: content });
+          broadcast({ type: "block_stop" });
         }
 
       } else if (message.type === "result") {
