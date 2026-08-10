@@ -48,15 +48,19 @@ let pendingAsk: {
 } | null = null;
 let askSeq = 0;
 
-// 把前端提交的答案（每题一个/多个 label）拼进 AskUserQuestion 期望的 input 结构。
-// SDK 期望的是"已选好答案"的 input：每个 question 加一个 answers（选中的 label 数组）。
+// 把前端提交的答案拼进 AskUserQuestion 期望的 input 结构。
+// 关键：SDK 期望 updatedInput 顶层有个 answers 字段，类型是 Record<问题文本, 答案字符串>，
+// 多选答案用逗号拼成一个字符串（见 cli.js 里 YN0 schema：answers: record(string,string)，
+// 描述 "question text -> answer string; multi-select answers are comma-separated"）。
+// 之前错塞成 questions[i].answers=[...]，SDK 读不到 → 拿到空答案。
 function buildAskUpdatedInput(input: any, picks: string[][]): Record<string, unknown> {
   const questions = Array.isArray(input?.questions) ? input.questions : [];
-  const merged = questions.map((q: any, i: number) => ({
-    ...q,
-    answers: picks[i] ?? [],
-  }));
-  return { ...input, questions: merged };
+  const answers: Record<string, string> = {};
+  questions.forEach((q: any, i: number) => {
+    const qText = String(q?.question ?? `Q${i + 1}`);
+    answers[qText] = (picks[i] ?? []).join(",");
+  });
+  return { ...input, answers };
 }
 
 // 给工具调用生成一行人类可读摘要，手机上一眼看清"在干什么"。
