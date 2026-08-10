@@ -37,12 +37,11 @@
     padding:12px; display:flex; flex-direction:column; gap:12px; }
   .ask-q { font-size:15px; font-weight:600; color:#e6edf3; word-break:break-word; }
   .ask-hint { font-size:12px; color:var(--muted); margin-top:-6px; }
-  .ask-opts { display:flex; flex-direction:column; gap:8px; }
+  .ask-opts { display:flex; flex-wrap:wrap; gap:8px; }
   .ask-opt { text-align:left; background:#0d1117; color:#e6edf3; border:1px solid #30363d;
-    border-radius:10px; padding:10px 12px; font-size:14px; line-height:1.35; cursor:pointer;
+    border-radius:16px; padding:7px 14px; font-size:14px; line-height:1.2; cursor:pointer;
     font-family:inherit; -webkit-tap-highlight-color:transparent; }
   .ask-opt .lbl { font-weight:600; }
-  .ask-opt .desc { display:block; margin-top:3px; font-size:12px; color:var(--muted); }
   .ask-opt.sel { border-color:#2ea043; background:#132a1b; }
   .ask-opt.sel .lbl::before { content:'✓ '; color:#2ea043; }
   .ask-send { align-self:flex-end; background:#2ea043; color:#fff; border:none; border-radius:10px;
@@ -154,7 +153,8 @@ function renderAsk(msg) {
       const b = document.createElement('button');
       b.type = 'button'; b.className = 'ask-opt';
       const l = document.createElement('span'); l.className='lbl'; l.textContent = label; b.appendChild(l);
-      if (desc) { const d = document.createElement('span'); d.className='desc'; d.textContent = desc; b.appendChild(d); }
+      // 描述放 title（长按/悬停可见），不占按钮高度，保持按钮短小。
+      if (desc) b.title = desc;
       b.addEventListener('click', () => {
         if (multi) {
           if (picks[qi].has(label)) { picks[qi].delete(label); b.classList.remove('sel'); }
@@ -312,10 +312,10 @@ function handle(msg) {
 
 // 生成中不禁用发送按钮——像 CLI 那样随时插话。
 // 默认行为=排队（不打断，排到当前轮后面，跑完自动接着处理），贴近 CLI。
-// 长按发送按钮=打断重说（掐断当前轮 + 清空排队，立即发这条）。
-// busy 只用来改按钮提示文字。
+// 按钮文案跟着输入框内容走：空 = 打断（点了就掐断当前轮），非空 = 排队（插到当前轮后面）。
 let busy = false;
-function setBusy(b) { busy = b; btn.textContent = b ? '发送·排队' : '发送'; }
+function setBusy(b) { busy = b; refreshBtn(); }
+function refreshBtn() { btn.textContent = ta.value.trim() ? '排队' : '打断'; }
 
 // 关键：不靠"相对路径 + 尾斜杠"。手机地址栏可能吃掉末尾的 /，导致 EventSource('stream')
 // 掉了 /<secret> 前缀撞 404、SSE 根本连不上（发送成功但收不到回复）。
@@ -368,7 +368,7 @@ conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSe
 async function send() {
   const text = ta.value.trim();
   const mode = text ? 'queue' : 'interrupt';
-  ta.value = ''; ta.style.height = 'auto';
+  ta.value = ''; ta.style.height = 'auto'; refreshBtn();
   try {
     if (mode === 'queue') setBusy(true);
     // 排队/打断由 server 按 mode 处理；用户气泡也由 server 回显（入队即显示）。
@@ -384,7 +384,8 @@ ta.addEventListener('keydown', (e) => {
     e.preventDefault(); send();
   }
 });
-ta.addEventListener('input', () => { ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,120)+'px'; });
+ta.addEventListener('input', () => { ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,120)+'px'; refreshBtn(); });
+refreshBtn();   // 初始为空 → 显示"打断"
 </script>
 </body>
 </html>
