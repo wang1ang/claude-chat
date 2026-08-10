@@ -28,28 +28,64 @@ const IS_TTY = !!(process.stdout.isTTY && process.stdin.isTTY);
 let inputBuf = "";           // 当前输入缓冲（raw mode 下自己维护，按 Unicode 码点）
 const PROMPT = `${C.green}${C.bold}你 ▸${C.reset} `;
 
+// 屏幕模型：内容区在上、输入行永远固定在最底一行，两者之间隔一个换行。
+//   - 静止时：光标停在输入行末尾（提示符 + 已输入内容）。
+//   - 写内容时：先擦掉输入行 → 把内容写进内容区 → 另起一行重画输入行。
+// AI 流式文本是"内容区最后一段"，其下方紧跟输入行。为了续写而不错位、也不让
+// 提示符闪烁，这里把当前这段 AI 文本整段缓存在 aiLine 里：每来一个碎片就
+//   上移到 AI 行行首 → 清掉 AI 行和下面的输入行 → 重写整段 aiLine → 换行画输入行。
+// 单行重画对流式速度完全够用，且天然正确处理光标定位。
+let aiFragOpen = false;   // 内容区最后一段是不是没收尾的 AI 流式文本
+let aiLine = "";          // 当前这段 AI 文本已累积的内容（含前缀 "Claude ◂ "）
+
 function clearInputLine() { if (IS_TTY) process.stdout.write("\r\x1b[K"); }   // 光标回行首、清到行尾
 function drawInputLine() { if (IS_TTY) process.stdout.write(PROMPT + inputBuf); }
 
-// 安全打印整行（自带换行）：内容永远落在输入行上方
+// 把没收尾的 AI 流式段落收个尾：光标此刻在输入行，上移清掉它、让 AI 行定格，
+// 之后调用方会另起内容。收尾后 aiFragOpen=false。
+function sealAiFrag() {
+  if (!aiFragOpen) return;
+  // 光标在输入行 → 擦掉输入行（AI 行保留在上面，作为已定格的历史）
+  clearInputLine();
+  aiFragOpen = false;
+  aiLine = "";
+}
+
+// 安全打印整行（自带换行）：内容永远落在输入行上方，输入行随后固定在下面。
 function out(line) {
   if (!IS_TTY) { console.log(line); return; }
-  clearInputLine();
+  if (aiFragOpen) sealAiFrag();     // 先给上方没收尾的 AI 段落定格
+  else clearInputLine();            // 否则擦掉输入行
   process.stdout.write(line + "\n");
   drawInputLine();
 }
-// 流式碎片（text_delta 用，无换行）：先擦输入行，写完不补换行，由 endAI() 收尾重画。
-let aiFragOpen = false;
+
+// 流式碎片（text_delta 用）：累积到 aiLine，重画"AI 段落 + 底部输入行"。
+// 输入行始终留在 AI 文本下面一行，Claude 说到一半也看得到 你 ▸。
 function outRaw(frag) {
   if (!IS_TTY) { process.stdout.write(frag); return; }
-  if (!aiFragOpen) { clearInputLine(); aiFragOpen = true; }
-  process.stdout.write(frag);
+  if (!aiFragOpen) {
+    // 首个碎片：擦掉输入行，就地起一段 AI 文本；下一行留给输入行。
+    clearInputLine();
+    aiFragOpen = true;
+    aiLine = "";
+  } else {
+    // 后续碎片：光标在输入行。上移一行回到 AI 行、回行首、清掉 AI 行准备重写。
+    process.stdout.write("\x1b[1A\r\x1b[K");
+  }
+  aiLine += frag;
+  process.stdout.write(aiLine);     // 重写整段 AI 文本
+  process.stdout.write("\n");        // 换行——输入行永远在它下面
+  drawInputLine();
 }
 
 function endAI() {
   if (!aiOpen) return;
   if (IS_TTY) {
-    if (aiFragOpen) { process.stdout.write("\n"); aiFragOpen = false; drawInputLine(); }
+    // outRaw 后画面是 [AI 行]\n[输入行]，光标在输入行。把这段 AI 文本定格即可：
+    // AI 行上方那个 \n 已经把它和后续内容分隔开，这里只需清掉 aiFragOpen 状态，
+    // 输入行本就在最底部、无需再动。（不要再补 \n，否则会多出一空行。）
+    aiFragOpen = false; aiLine = "";
   } else {
     process.stdout.write("\n");
   }
@@ -300,5 +336,5 @@ if (IS_TTY) {
 
 out(`${C.dim}claude-chat 跟看中。直接打字回车发消息；Ctrl-C 中断当前生成，连按两次退出并全关。${C.reset}`);
 printUrl();   // 一进来先钉一遍网址（不再依赖 SSE 的 hello 事件；历史铺完 history_end 还会再钉）
-drawInputLine();  // 画出底部输入行
+// out() 末尾已经画好底部输入行，这里不再重复 drawInputLine（否则会出现两行"你 ▸"）。
 connect();
