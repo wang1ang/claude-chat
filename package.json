@@ -1,0 +1,16 @@
+{
+  "name": "claude-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "手机聊天框接管本地 Claude Code 会话（resume）",
+  "scripts": {
+    "start": "tsx server.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  }
+}

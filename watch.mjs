@@ -1,0 +1,132 @@
+// claude-chat 的电脑端只读跟看：连本地 SSE，把事件 pretty-print 到终端。
+// 用法（由 claude-chat-watch 调用）：PORT=.. SECRET=.. node watch.mjs
+import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+const PORT = process.env.PORT;
+const SECRET = process.env.SECRET;
+if (!PORT || !SECRET) { console.error("缺 PORT/SECRET"); process.exit(1); }
+
+const C = {
+  reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
+  green: "\x1b[32m", cyan: "\x1b[36m", yellow: "\x1b[33m", blue: "\x1b[34m", red: "\x1b[31m", gray: "\x1b[90m",
+};
+const stamp = () => { const d = new Date(); return C.gray + d.toTimeString().slice(0, 8) + C.reset; };
+
+let aiOpen = false;          // 当前是否正在打印一段 AI 文本
+let inHistory = false;
+
+function endAI() { if (aiOpen) { process.stdout.write("\n"); aiOpen = false; } }
+
+function render(o) {
+  switch (o.type) {
+    case "hello":
+      console.log(`${C.dim}── 已连接跟看${o.sessionId ? "，会话 " + o.sessionId.slice(0, 8) : "（新会话）"} ──${C.reset}`);
+      break;
+    case "history_start":
+      inHistory = true;
+      console.log(`${C.dim}┄┄ 历史（${o.count} 条）┄┄${C.reset}`);
+      break;
+    case "history_end":
+      inHistory = false;
+      console.log(`${C.dim}┄┄ 以上为历史，下面是实时 ┄┄${C.reset}`);
+      break;
+    case "user":
+      endAI();
+      console.log(`${stamp()} ${C.green}${C.bold}你 ▸${C.reset} ${o.text}`);
+      break;
+    case "ai": // 历史里的整条 AI
+      endAI();
+      console.log(`${stamp()} ${C.cyan}${C.bold}Claude ◂${C.reset} ${o.text}`);
+      break;
+    case "status":
+      if (!inHistory) console.log(`${C.gray}   … ${o.text}${C.reset}`);
+      break;
+    case "tool_start":
+      endAI();
+      console.log(`${stamp()} ${C.yellow}🔧 ${o.name}${C.reset}`);
+      break;
+    case "text_delta":
+      if (!aiOpen) { process.stdout.write(`${stamp()} ${C.cyan}${C.bold}Claude ◂${C.reset} `); aiOpen = true; }
+      process.stdout.write(o.text);
+      break;
+    case "block_stop":
+      endAI();
+      break;
+    case "done":
+      endAI();
+      console.log(`${C.dim}   ✓ 完成${C.reset}`);
+      break;
+    case "error":
+      endAI();
+      console.log(`${C.red}   ⚠️ ${o.message}${C.reset}`);
+      break;
+  }
+}
+
+// 简单 SSE 客户端（用内置 fetch 流式读，避免额外依赖）
+async function connect() {
+  const url = `http://127.0.0.1:${PORT}/${SECRET}/stream`;
+  for (;;) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          for (const line of chunk.split("\n")) {
+            if (line.startsWith("data:")) {
+              const s = line.slice(5).trim();
+              if (s) { try { render(JSON.parse(s)); } catch {} }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.log(`${C.gray}（连接断开，2s 后重连… ${e.message}）${C.reset}`);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+// Ctrl-C：第一次中断 claude 当前生成；1.5s 内再按一次 → 退出并全关（服务+隧道）。
+const PID_FILE = process.env.PID_FILE;
+let lastSigint = 0;
+
+async function postInterrupt() {
+  try { await fetch(`http://127.0.0.1:${PORT}/${SECRET}/interrupt`, { method: "POST" }); } catch {}
+}
+function shutdownAll() {
+  // 1) kill pid 文件里记录的父进程（连同进程组）
+  try {
+    for (const line of readFileSync(PID_FILE, "utf8").split("\n")) {
+      const pid = parseInt(line.trim(), 10);
+      if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} }
+    }
+  } catch {}
+  // 2) 兜底按名清这一份的 server（tsx/node 子进程树）+ cloudflared（按端口，无 $ 锚点更稳）
+  const kill = (pat) => { try { execSync(`pkill -f ${JSON.stringify(pat)}`, { stdio: "ignore" }); } catch {} };
+  kill(`/claude-chat/server.ts`);
+  kill(`cloudflared tunnel --url http://127.0.0.1:${PORT}`);
+}
+
+process.on("SIGINT", () => {
+  const now = Date.now();
+  if (now - lastSigint < 1500) {
+    console.log(`\n${C.dim}正在关闭服务和隧道…${C.reset}`);
+    shutdownAll();
+    console.log(`${C.dim}已全部停止。再见 👋${C.reset}`);
+    process.exit(0);
+  }
+  lastSigint = now;
+  console.log(`\n${C.yellow}↯ 已请求中断当前生成${C.reset} ${C.dim}(1.5秒内再按一次 Ctrl-C 退出并全关)${C.reset}`);
+  postInterrupt();
+});
+
+console.log(`${C.dim}claude-chat 跟看中（只读）。Ctrl-C 中断当前生成；连按两次退出并全关。${C.reset}`);
+connect();

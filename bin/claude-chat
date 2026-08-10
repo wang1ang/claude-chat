@@ -1,0 +1,119 @@
+#!/bin/zsh
+# 手机聊天框接管本地 Claude Code 会话（不是终端，是真·聊天气泡）。
+#   claude-chat                 新开一段对话
+#   claude-chat <session-id>    resume 那段对话的完整上下文
+#   claude-chat --model <m> <session-id>   指定模型（可选）
+# 起本地 Node 服务 + cloudflared 隧道 + 隐藏路径暗号，打印完整手机网址，
+# 然后当前终端变成只读跟看视图。
+# Ctrl-C：一次中断 claude 当前生成；1.5 秒内连按两次 → 退出跟看并全关服务+隧道。
+
+set -e
+
+APP_DIR=/Users/yang.wang/.local/claude-chat
+CFD=/opt/homebrew/bin/cloudflared
+NODE=$(command -v node)
+NPX=$(command -v npx)
+BASE_PORT=8790
+
+# ── Bedrock 环境：强制重置成干净的那套（等价于 .zshrc 里的 pi-env alias）。
+# 当前 shell 可能被 spaas kubernetes configure 污染成 tokyo/静态 key，会顶掉 credential_process
+# 自动刷新，导致后台 claude 调 Bedrock 被"AWS 认证"拦住。这里显式修正后再传给 server。
+export CLAUDE_CODE_USE_BEDROCK=1
+export AWS_PROFILE=ClaudeCode
+export AWS_REGION=us-west-2
+export AWS_DEFAULT_REGION=us-west-2
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+# 预检：凭证现在能不能用（credential_process 会自动刷新；真过期才会失败）。
+# 后台进程弹不出 SSO 登录，所以必须在这里先探明、失败就让用户手动处理，别让手机端默默卡死。
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+  echo "❌ AWS Bedrock 凭证当前不可用（AWS_PROFILE=$AWS_PROFILE, AWS_REGION=$AWS_REGION）。"
+  echo "   请先在终端里恢复登录，再重跑 claude-chat：例如"
+  echo "     aws sso login --profile $AWS_PROFILE"
+  echo "   或按你平时刷新 ClaudeCode 凭证的方式操作。"
+  exit 1
+fi
+
+# 解析参数。session-id 可以直接给，也可以写成 --resume <id>（兼容 claude-web 的习惯）。
+# --dangerously-skip-permissions 这里无意义（工具已自动全允许），吃掉忽略。
+MODEL=""
+SESSION_ID=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) MODEL="$2"; shift 2 ;;
+    --model=*) MODEL="${1#--model=}"; shift ;;
+    --resume|-r) SESSION_ID="$2"; shift 2 ;;
+    --resume=*) SESSION_ID="${1#--resume=}"; shift ;;
+    --dangerously-skip-permissions|--dsp) shift ;;   # 无意义，忽略
+    --*) echo "（忽略未知选项 $1）"; shift ;;          # 别再被当成 session-id
+    *) [ -z "$SESSION_ID" ] && SESSION_ID="$1"; shift ;;
+  esac
+done
+
+# 找空闲编号 N（按 pid 文件占用），端口 = BASE_PORT + N
+N=1
+while [ -f "/tmp/claude-chat-$N.pids" ]; do N=$((N+1)); done
+PORT=$((BASE_PORT + N))
+CF_LOG="/tmp/claude-chat-$N-cf.log"
+SRV_LOG="/tmp/claude-chat-$N-srv.log"
+PID_FILE="/tmp/claude-chat-$N.pids"
+
+# 隐藏路径暗号（跟 claude-web 一致的防护层）
+SECRET=$(openssl rand -hex 8)
+
+# 会话绑项目目录：默认用你运行 claude-chat 时所在的目录当 cwd，这样 resume/落盘的项目对得上。
+# 想指定别的目录：CHAT_CWD=/path claude-chat <id>
+CWD="${CHAT_CWD:-$PWD}"
+
+# 1) 后台起 Node 服务
+: > "$SRV_LOG"
+SESSION_ID="$SESSION_ID" MODEL="$MODEL" PORT="$PORT" SECRET="$SECRET" CHAT_CWD="$CWD" \
+  nohup "$NPX" --prefix "$APP_DIR" tsx "$APP_DIR/server.ts" >"$SRV_LOG" 2>&1 &
+echo $! > "$PID_FILE"
+
+# 等服务起来（探本地暗号路径）
+echo -n "启动本地服务"
+for i in {1..30}; do
+  if curl -s -o /dev/null "http://127.0.0.1:$PORT/$SECRET/"; then break; fi
+  echo -n "."; sleep 0.5
+done
+echo ""
+if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/$SECRET/"; then
+  echo "❌ 本地服务没起来，看日志：$SRV_LOG"; tail -20 "$SRV_LOG"; exit 1
+fi
+
+# 2) 后台起 cloudflared 隧道
+: > "$CF_LOG"
+nohup "$CFD" tunnel --url "http://127.0.0.1:$PORT" >"$CF_LOG" 2>&1 &
+echo $! >> "$PID_FILE"
+
+# 3) 抓公开网址
+echo -n "正在建立隧道"
+URL=""
+for i in {1..40}; do
+  URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" | head -1)
+  [ -n "$URL" ] && break
+  echo -n "."; sleep 1
+done
+echo ""
+if [ -z "$URL" ]; then
+  echo "❌ 没拿到隧道网址，看日志：$CF_LOG"; exit 1
+fi
+
+# 暗号防护做在 Node 服务里：完整网址带 /<暗号>/ 前缀，根路径 404。
+FULL_URL="$URL/$SECRET/"
+echo ""
+echo "=============== 第 $N 份 · 手机浏览器打开（聊天框） ==============="
+echo "网址:   $FULL_URL"
+echo "==============================================================="
+echo "会话:   ${SESSION_ID:-新开}    模型: ${MODEL:-默认}"
+echo "目录:   $CWD  （会话按此目录对应的项目查找/落盘；不对就先 cd 过去再跑）"
+echo "带隐藏路径暗号，务必用完整网址（末尾那段不能少，去掉就 404）。"
+echo "⚠️  MVP 阶段工具全自动允许——手机上发指令 = 授权它在你电脑上读写/跑命令。请勿外泄网址。"
+echo "下面是电脑端实时跟看（只读）· Ctrl-C 中断生成，连按两次退出并全关 ↓"
+echo ""
+echo "第 $N 份(chat): $FULL_URL  会话:${SESSION_ID:-新}" >> ~/.claude-web-urls
+
+# 当前终端直接变成只读跟看视图（前台）。
+# Ctrl-C：一次中断当前生成；1.5s 内连按两次 → 退出并全关服务+隧道。
+exec env PORT="$PORT" SECRET="$SECRET" PID_FILE="$PID_FILE" "$NODE" "$APP_DIR/watch.mjs"

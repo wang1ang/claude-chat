@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+# 运行期临时文件（启动脚本写在 /tmp，正常不会落到这里，保险起见）
+claude-chat-*.pids
+claude-chat-*-cf.log
+claude-chat-*-srv.log
+# 本地临时试验脚本
+cc-resume-test*.mjs
