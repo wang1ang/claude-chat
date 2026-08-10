@@ -311,11 +311,13 @@ function handle(msg) {
 }
 
 // 生成中不禁用发送按钮——像 CLI 那样随时插话。
-// 默认行为=排队（不打断，排到当前轮后面，跑完自动接着处理），贴近 CLI。
-// 按钮文案跟着输入框内容走：空 = 打断（点了就掐断当前轮），非空 = 排队（插到当前轮后面）。
-let busy = false;
+// 按钮文案同时兼当"忙闲指示"，让手机一眼看出 agent 说完没：
+//   空闲（这轮说完了）        → "发送"（不管输入框空不空）
+//   在跑 + 输入框有字         → "排队"（发出去排到当前轮后面）
+//   在跑 + 输入框空           → "打断"（点了就掐断当前轮）
+let busy = false;   // = agent 正在跑（服务端 running）。由 poll() 的 running 和事件共同维护。
 function setBusy(b) { busy = b; refreshBtn(); }
-function refreshBtn() { btn.textContent = ta.value.trim() ? '排队' : '打断'; }
+function refreshBtn() { btn.textContent = !busy ? '发送' : (ta.value.trim() ? '排队' : '打断'); }
 
 // 关键：不靠"相对路径 + 尾斜杠"。手机地址栏可能吃掉末尾的 /，导致 EventSource('stream')
 // 掉了 /<secret> 前缀撞 404、SSE 根本连不上（发送成功但收不到回复）。
@@ -344,6 +346,8 @@ async function poll() {
       if (ev.seq > lastSeq) lastSeq = ev.seq;
       handle(ev);
     }
+    // 忙闲以服务端 running 为准（跨刷新/多端/后台切回都对）：驱动发送按钮文案。
+    if (typeof data.running === 'boolean' && data.running !== busy) setBusy(data.running);
   } catch {
     failStreak++;
     conn.textContent = failStreak > 2 ? '连接中…' : '已连接';
@@ -385,7 +389,7 @@ ta.addEventListener('keydown', (e) => {
   }
 });
 ta.addEventListener('input', () => { ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,120)+'px'; refreshBtn(); });
-refreshBtn();   // 初始为空 → 显示"打断"
+refreshBtn();   // 初始 busy=false → 显示"发送"；首个 poll 的 running 会立即校准
 </script>
 </body>
 </html>
