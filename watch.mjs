@@ -178,6 +178,7 @@ function App() {
   const lastSigintRef = useRef(0);
   const liveRef = useRef("");                   // 与 live 同步，供闭包读取
   const inHistoryRef = useRef(false);           // 是否在回放历史（旧 ask 不接受回答）
+  const sessionIdRef = useRef("");              // 当前会话 id（退出时打出来供 resume）
 
   const key = useRef(0);
   const pushLine = (kind, text) => setLines((L) => [...L, { key: key.current++, kind, text }]);
@@ -223,6 +224,7 @@ function App() {
         for (const l of urlLines()) pushLine(l.kind, l.text);
         break;
       case "session":
+        if (o.sessionId) sessionIdRef.current = o.sessionId;
         pushLine("sep", `── 会话 ${String(o.sessionId || "").slice(0, 8)} ──`);
         break;
       case "user":
@@ -267,6 +269,7 @@ function App() {
         commitLive();
         break;
       case "done":
+        if (o.sessionId) sessionIdRef.current = o.sessionId;   // 兜底：新会话首轮结束才拿到 id
         commitLive();
         setStatus("");
         pushLine("dim", "✓ 完成");
@@ -283,9 +286,23 @@ function App() {
     if (k.ctrl && inputCh === "c") {
       const now = Date.now();
       if (now - lastSigintRef.current < 1500) {
-        shutdownAll();
-        exit();
-        setTimeout(() => process.exit(0), 50);
+        const sid = sessionIdRef.current;
+        exit();                       // 先卸载 Ink，退出 alt-screen、恢复正常终端
+        // Ink 卸载后再往真实 stdout 打印 resume 提示——否则会被 alt-screen 清掉看不到。
+        setTimeout(() => {
+          if (sid) {
+            process.stdout.write(
+              `\n继续这段会话（接着聊）:\n` +
+              `  claude-chat ${sid}\n` +
+              `或用官方 CLI 接管:\n` +
+              `  claude --resume ${sid}\n\n`
+            );
+          } else {
+            process.stdout.write(`\n（本次没产生可 resume 的会话 id——还没开始对话就退出了。）\n\n`);
+          }
+          shutdownAll();
+          process.exit(0);
+        }, 50);
         return;
       }
       lastSigintRef.current = now;
