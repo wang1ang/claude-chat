@@ -188,15 +188,40 @@ function readHistory(sessionId: string): any[] {
 // 当前飞行中的中断器（Ctrl-C / 前端调 /interrupt 时用它掐断 claude 这一轮生成）
 let currentAbort: AbortController | null = null;
 
+// 待处理队列：贴近 CLI 体验——生成中再发不打断当前轮，而是排队，等这轮跑完自动接着发。
+const QUEUE: string[] = [];
+
+// 外部入口：发一条消息。running 时排队（默认），否则立刻跑。
+function enqueuePrompt(text: string) {
+  QUEUE.push(text);
+  broadcast({ type: "user", text });                 // 立刻回显用户气泡
+  if (running) {
+    broadcast({ type: "status", text: "已排队，等当前这轮完成后处理…" });
+  } else {
+    void drainQueue();
+  }
+}
+
+// 依次把队列跑干净。runPrompt 结束后会再调一次，接着处理下一条。
+async function drainQueue() {
+  if (running) return;
+  const next = QUEUE.shift();
+  if (next === undefined) return;
+  await runPrompt(next);
+  if (QUEUE.length) void drainQueue();
+}
+
 // ---- 驱动一次 claude 调用，把事件翻译成聊天用的简单协议推给前端 ----
+// 注意：用户气泡的回显已挪到 enqueuePrompt（入队即显示），这里不再重复 broadcast user。
 async function runPrompt(prompt: string) {
   if (running) {
-    broadcast({ type: "error", message: "上一条还在处理，请稍候。" });
+    // 理论上不会走到（drainQueue 保证串行），保险起见排队。
+    QUEUE.push(prompt);
     return;
   }
   running = true;
   if (process.env.CC_DEBUG) console.error(`[runPrompt] prompt=${JSON.stringify(prompt)} resume=${SESSION_ID ?? "(新)"}`);
-  broadcast({ type: "user", text: prompt });      // 回显用户气泡
+  // 用户气泡已在 enqueuePrompt 里回显过，这里只发"思考中"。
   broadcast({ type: "status", text: "思考中…" });
 
   const abort = new AbortController();
@@ -303,6 +328,9 @@ async function runPrompt(prompt: string) {
     if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
     // 只有 result 没发过 done 时（中断/报错/异常提前退出）才补一个，避免重复"✓ 完成"
     if (!sentDone) broadcast({ type: "done", subtype: "idle" });
+    // 兜底：这一轮结束后若队列里还有排队的消息，接着跑（正常情况下 drainQueue 的循环已经会接手，
+    // 这里再兜一次，防止某些边界下没人续上导致排队消息卡住）。
+    if (QUEUE.length) void drainQueue();
   }
 }
 
@@ -350,12 +378,19 @@ const server = createServer(async (req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      let text = "";
-      try { text = JSON.parse(body).text ?? ""; } catch {}
+      let text = "", mode = "queue";
+      try { const j = JSON.parse(body); text = j.text ?? ""; mode = j.mode ?? "queue"; } catch {}
       text = String(text).trim();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
-      if (text) runPrompt(text);                    // 异步跑，事件走 SSE
+      if (!text) return;
+      // mode=interrupt：像"打断重说"——先掐断当前这轮，清空还没跑的排队，再把新消息入队立即跑。
+      // mode=queue（默认）：贴近 CLI——不打断，排到当前轮后面，跑完自动接着处理。
+      if (mode === "interrupt" && running && currentAbort) {
+        QUEUE.length = 0;
+        currentAbort.abort();
+      }
+      enqueuePrompt(text);
     });
     return;
   }

@@ -310,10 +310,12 @@ function handle(msg) {
   }
 }
 
-// 生成中不再禁用发送按钮——要能像 CLI 那样随时插话。busy 只用来决定：
-// 生成中再发 = 先中断当前轮再发新消息（打断重说）。按钮文字随状态变，提示当前可打断。
+// 生成中不禁用发送按钮——像 CLI 那样随时插话。
+// 默认行为=排队（不打断，排到当前轮后面，跑完自动接着处理），贴近 CLI。
+// 长按发送按钮=打断重说（掐断当前轮 + 清空排队，立即发这条）。
+// busy 只用来改按钮提示文字。
 let busy = false;
-function setBusy(b) { busy = b; btn.textContent = b ? '打断' : '发送'; }
+function setBusy(b) { busy = b; btn.textContent = b ? '发送·排队' : '发送'; }
 
 // 关键：不靠"相对路径 + 尾斜杠"。手机地址栏可能吃掉末尾的 /，导致 EventSource('stream')
 // 掉了 /<secret> 前缀撞 404、SSE 根本连不上（发送成功但收不到回复）。
@@ -361,30 +363,39 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 // 电脑 CLI 后续写进 jsonl 的新内容，靠这个从头拉过来。
 conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; toolPending=[]; poll(); });
 
-async function send() {
+// mode: 'queue'（默认，排队不打断）| 'interrupt'（打断重说，长按发送触发）
+async function send(mode) {
   const text = ta.value.trim();
   if (!text) return;
   ta.value = ''; ta.style.height = 'auto';
   try {
-    // 生成中发送 = 像 CLI 那样打断重说：先中断当前轮，略等它收尾，再发新消息。
-    // （server 单飞行，不先中断的话新消息会被「上一条还在处理」顶回。）
-    if (busy) {
-      try { await fetch(BASE + 'interrupt', { method:'POST' }); } catch {}
-      await new Promise(r => setTimeout(r, 400));
-    }
     setBusy(true);
+    // 具体排队/打断由 server 按 mode 处理；用户气泡也由 server 回显（入队即显示）。
     await fetch(BASE + 'send', { method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ text }) });
+      body: JSON.stringify({ text, mode: mode || 'queue' }) });
   } catch { setBusy(false); addBubble('status','⚠️ 发送失败'); }
 }
 
-form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
+form.addEventListener('submit', (e) => { e.preventDefault(); send('queue'); });
 // 手机上回车换行、点发送按钮提交；桌面 Enter 发送、Shift+Enter 换行
 ta.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !matchMedia('(pointer:coarse)').matches) {
-    e.preventDefault(); send();
+    e.preventDefault(); send('queue');
   }
 });
+// 长按发送按钮 = 打断重说（掐断当前轮 + 清空排队，立即发这条）。
+// 用一个标记：长按触发后，随之而来的 click（submit）就跳过，避免又按 queue 发一遍。
+let lpTimer = null, lpFired = false;
+function armLongPress() { lpFired = false; clearTimeout(lpTimer); lpTimer = setTimeout(() => { lpFired = true; if (navigator.vibrate) navigator.vibrate(30); send('interrupt'); }, 550); }
+function cancelLongPress() { clearTimeout(lpTimer); }
+btn.addEventListener('touchstart', armLongPress, { passive: true });
+btn.addEventListener('touchend', cancelLongPress);
+btn.addEventListener('touchmove', cancelLongPress, { passive: true });
+btn.addEventListener('mousedown', armLongPress);
+btn.addEventListener('mouseup', cancelLongPress);
+btn.addEventListener('mouseleave', cancelLongPress);
+// 若长按已触发过发送，吞掉紧接着的 click（表单 submit），避免重复发。
+btn.addEventListener('click', (e) => { if (lpFired) { e.preventDefault(); e.stopPropagation(); lpFired = false; } }, true);
 ta.addEventListener('input', () => { ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,120)+'px'; });
 </script>
 </body>
