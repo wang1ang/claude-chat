@@ -36,6 +36,29 @@ function broadcast(obj: any) {
   if (EVENTS.length > MAX_EVENTS) EVENTS.splice(0, EVENTS.length - MAX_EVENTS);
 }
 
+// ---- AskUserQuestion 挂起：让手机能点选项回答 ----
+// 工具本来全自动放行（见 canUseTool）；唯独 AskUserQuestion 要停下来等人。
+// 拦到它时：广播一个 ask 事件（带 id + 问题 + 选项）给前端渲染成按钮，
+// 然后返回一个 Promise 挂起；等 POST /answer 带着 id + 选择进来，resolve 它，
+// 把用户的选择作为 updatedInput 交回 SDK（相当于替 SDK 填好"用户选了啥"）。
+let pendingAsk: {
+  id: string;
+  input: any;
+  resolve: (updatedInput: Record<string, unknown>) => void;
+} | null = null;
+let askSeq = 0;
+
+// 把前端提交的答案（每题一个/多个 label）拼进 AskUserQuestion 期望的 input 结构。
+// SDK 期望的是"已选好答案"的 input：每个 question 加一个 answers（选中的 label 数组）。
+function buildAskUpdatedInput(input: any, picks: string[][]): Record<string, unknown> {
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+  const merged = questions.map((q: any, i: number) => ({
+    ...q,
+    answers: picks[i] ?? [],
+  }));
+  return { ...input, questions: merged };
+}
+
 // 给工具调用生成一行人类可读摘要，手机上一眼看清"在干什么"。
 // 常见工具挑最能说明意图的字段；未知工具退化成截断的 JSON。
 function toolSummary(name: string, input: any): string {
@@ -181,8 +204,26 @@ async function runPrompt(prompt: string) {
       prompt,
       options: {
         ...(SESSION_ID ? { resume: SESSION_ID } : {}),
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,      // MVP：工具全自动允许
+        // 注意：不能再用 bypassPermissions——那样 SDK 会跳过 canUseTool 回调，
+        // 就没机会拦 AskUserQuestion 让手机回答了。改用 canUseTool：默认全放行（MVP 保持
+        // 工具自动允许），唯独 AskUserQuestion 挂起等手机点选项。
+        canUseTool: async (toolName: string, input: Record<string, unknown>) => {
+          if (toolName === "AskUserQuestion") {
+            const id = `ask${++askSeq}`;
+            const questions = Array.isArray((input as any).questions) ? (input as any).questions : [];
+            broadcast({ type: "ask", id, questions });
+            broadcast({ type: "status", text: "等你在手机上选择…" });
+            if (process.env.CC_DEBUG) console.error(`[ask] ${id} ${JSON.stringify(questions).slice(0, 200)}`);
+            return await new Promise<{ behavior: "allow"; updatedInput: Record<string, unknown> }>((resolve) => {
+              pendingAsk = {
+                id,
+                input,
+                resolve: (updatedInput) => resolve({ behavior: "allow", updatedInput }),
+              };
+            });
+          }
+          return { behavior: "allow", updatedInput: input };
+        },
         includePartialMessages: true,               // token 级增量
         ...(MODEL ? { model: MODEL } : {}),
         cwd: CWD,
@@ -206,7 +247,9 @@ async function runPrompt(prompt: string) {
         // 工具开始的即时提示：stream 里 content_block_start 时 input 还是空的（参数随后才 delta 出来），
         // 所以这里只发一个"工具开始"占位；完整参数由下面的 assistant 消息补齐成 tool_use 详情。
         if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
-          broadcast({ type: "tool_start", name: ev.content_block.name });
+          // AskUserQuestion 不发工具占位——它由 canUseTool 拦下并广播成可交互的 ask 事件，
+          // 免得又冒一条 🔧 占位气泡跟提问按钮打架。
+          if (ev.content_block.name !== "AskUserQuestion") broadcast({ type: "tool_start", name: ev.content_block.name });
         } else if (ev.type === "content_block_delta") {
           if (ev.delta?.type === "text_delta") {
             broadcast({ type: "text_delta", text: ev.delta.text });
@@ -225,7 +268,8 @@ async function runPrompt(prompt: string) {
         if (Array.isArray(content)) {
           for (const b of content) {
             if (b?.type === "tool_use") {
-              broadcast({ type: "tool_use", name: b.name, summary: toolSummary(b.name, b.input), input: b.input ?? {} });
+              // AskUserQuestion 跳过——已由 canUseTool 广播成交互式 ask 事件。
+              if (b.name !== "AskUserQuestion") broadcast({ type: "tool_use", name: b.name, summary: toolSummary(b.name, b.input), input: b.input ?? {} });
             } else if (!streamedText && b?.type === "text" && b.text) {
               // 兜底：这一轮没走 token 流（短回复/某些路径），从完整消息补发文字，
               // 否则手机端会从"思考中"直接跳到"完成"、看不到回复。
@@ -251,6 +295,8 @@ async function runPrompt(prompt: string) {
   } finally {
     running = false;
     if (currentAbort === abort) currentAbort = null;
+    // 这一轮结束时若还挂着没答的问题（中断/报错），清掉并让前端撤下按钮，免得留个死按钮。
+    if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
     // 只有 result 没发过 done 时（中断/报错/异常提前退出）才补一个，避免重复"✓ 完成"
     if (!sentDone) broadcast({ type: "done", subtype: "idle" });
   }
@@ -306,6 +352,39 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       if (text) runPrompt(text);                    // 异步跑，事件走 SSE
+    });
+    return;
+  }
+
+  // 回答 AskUserQuestion：body = { id, picks: string[][] }
+  // picks[i] 是第 i 个问题选中的 label 数组（单选就 1 个，多选可多个）。
+  if (req.method === "POST" && path === "/answer") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let id = "", picks: string[][] = [];
+      try { const j = JSON.parse(body); id = j.id ?? ""; picks = Array.isArray(j.picks) ? j.picks : []; } catch {}
+      if (!pendingAsk) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "没有待回答的问题" }));
+        return;
+      }
+      if (id && id !== pendingAsk.id) {
+        // 过期的回答（可能是上一个问题的按钮），忽略。
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "问题已过期" }));
+        return;
+      }
+      const ask = pendingAsk;
+      pendingAsk = null;
+      const flat = picks.flat().filter(Boolean);
+      broadcast({ type: "ask_answered", id: ask.id, picks });
+      broadcast({ type: "user", text: "（已选）" + (flat.length ? flat.join("、") : "—") });
+      broadcast({ type: "status", text: "思考中…" });
+      if (process.env.CC_DEBUG) console.error(`[answer] ${ask.id} picks=${JSON.stringify(picks)}`);
+      ask.resolve(buildAskUpdatedInput(ask.input, picks));   // 唤醒挂起的 canUseTool
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
     });
     return;
   }

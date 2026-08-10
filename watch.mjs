@@ -17,6 +17,7 @@ const stamp = () => { const d = new Date(); return C.gray + d.toTimeString().sli
 
 let aiOpen = false;          // 当前是否正在打印一段 AI 文本
 let inHistory = false;
+let termAsk = null;          // 当前待回答的 AskUserQuestion：{ id, questions }（终端可用数字回答）
 
 function endAI() { if (aiOpen) { process.stdout.write("\n"); aiOpen = false; } }
 
@@ -62,6 +63,28 @@ function render(o) {
     case "tool_use":
       endAI();
       console.log(`${stamp()} ${C.yellow}🔧 ${o.name}${o.summary ? " " + C.dim + o.summary + C.reset : ""}${C.reset}`);
+      break;
+    case "ask": {
+      endAI();
+      if (inHistory) break;   // 历史里的旧问题不再接受回答
+      termAsk = { id: o.id, questions: Array.isArray(o.questions) ? o.questions : [] };
+      console.log(`${C.yellow}${C.bold}❓ Claude 在提问（回复选项编号即可，多题用 ; 分隔，多选用逗号）：${C.reset}`);
+      termAsk.questions.forEach((q, qi) => {
+        console.log(`${C.bold}  Q${qi + 1}. ${q.question || ""}${C.reset}${q.multiSelect ? C.dim + "（可多选）" + C.reset : ""}`);
+        (q.options || []).forEach((op, oi) => {
+          const label = typeof op === "string" ? op : (op.label || "");
+          const desc = typeof op === "string" ? "" : (op.description || "");
+          console.log(`     ${C.cyan}${oi + 1})${C.reset} ${label}${desc ? C.dim + " — " + desc + C.reset : ""}`);
+        });
+      });
+      console.log(`${C.dim}     例：单题单选输 1；单题多选输 1,3；两题输 1;2${C.reset}`);
+      break;
+    }
+    case "ask_answered":
+      if (termAsk && termAsk.id === o.id) termAsk = null;
+      break;
+    case "ask_clear":
+      if (termAsk && termAsk.id === o.id) { termAsk = null; console.log(`${C.dim}   （问题已取消）${C.reset}`); }
       break;
     case "text_delta":
       if (!aiOpen) { process.stdout.write(`${stamp()} ${C.cyan}${C.bold}Claude ◂${C.reset} `); aiOpen = true; }
@@ -119,6 +142,29 @@ async function postSend(text) {
     console.log(`${C.red}   ⚠️ 发送失败：${e.message}${C.reset}`);
   }
 }
+async function postAnswer(id, picks) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/${SECRET}/answer`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, picks }),
+    });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); console.log(`${C.red}   ⚠️ 回答失败：${j.error || r.status}${C.reset}`); }
+  } catch (e) {
+    console.log(`${C.red}   ⚠️ 回答失败：${e.message}${C.reset}`);
+  }
+}
+// 把终端输入（"1;2"、"1,3"）解析成 picks: string[][]（每题选中的 label 数组）。
+function parseAnswer(line, questions) {
+  const perQ = line.split(";").map(s => s.trim());
+  return questions.map((q, qi) => {
+    const opts = q.options || [];
+    const chunk = perQ[qi] ?? perQ[0] ?? "";   // 单题时允许不带分号
+    const nums = chunk.split(/[, ]+/).map(s => parseInt(s, 10)).filter(n => n >= 1 && n <= opts.length);
+    const labels = nums.map(n => { const op = opts[n - 1]; return typeof op === "string" ? op : (op.label || ""); });
+    return [...new Set(labels)];
+  });
+}
 function shutdownAll() {
   // 1) kill pid 文件里记录的父进程（连同进程组）
   try {
@@ -156,6 +202,18 @@ const rl = createInterface({ input: process.stdin, output: process.stdout, termi
 rl.on("line", (line) => {
   const text = line.trim();
   if (!text) return;
+  // 有待回答的选择题时，输入按"选项编号"解析并走 /answer；否则当普通消息发。
+  if (termAsk) {
+    const picks = parseAnswer(text, termAsk.questions);
+    if (picks.every(p => p.length === 0)) {
+      console.log(`${C.dim}   （没识别到有效编号；每题至少选一个，如 1 或 1,3 或 1;2）${C.reset}`);
+      return;
+    }
+    const { id } = termAsk;
+    termAsk = null;   // 乐观清掉，服务端确认后也会广播 ask_answered
+    postAnswer(id, picks);
+    return;
+  }
   // 不在本地回显——server 会 broadcast 一个 user 事件，轮询拉回来由 render 统一显示，
   // 避免同一句话打印两次。
   postSend(text);

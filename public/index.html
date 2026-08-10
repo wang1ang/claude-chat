@@ -33,6 +33,23 @@
   .tool-detail { margin:8px 0 0; padding:8px; background:#0d1117; border-radius:8px;
     font-size:12px; line-height:1.4; color:#c9d1d9; white-space:pre-wrap; word-break:break-word;
     overflow-wrap:anywhere; max-height:40vh; overflow-y:auto; }
+  .ask { align-self:stretch; background:#1c2333; border:1px solid #30506e; border-radius:12px;
+    padding:12px; display:flex; flex-direction:column; gap:12px; }
+  .ask-q { font-size:15px; font-weight:600; color:#e6edf3; word-break:break-word; }
+  .ask-hint { font-size:12px; color:var(--muted); margin-top:-6px; }
+  .ask-opts { display:flex; flex-direction:column; gap:8px; }
+  .ask-opt { text-align:left; background:#0d1117; color:#e6edf3; border:1px solid #30363d;
+    border-radius:10px; padding:10px 12px; font-size:14px; line-height:1.35; cursor:pointer;
+    font-family:inherit; -webkit-tap-highlight-color:transparent; }
+  .ask-opt .lbl { font-weight:600; }
+  .ask-opt .desc { display:block; margin-top:3px; font-size:12px; color:var(--muted); }
+  .ask-opt.sel { border-color:#2ea043; background:#132a1b; }
+  .ask-opt.sel .lbl::before { content:'✓ '; color:#2ea043; }
+  .ask-send { align-self:flex-end; background:#2ea043; color:#fff; border:none; border-radius:10px;
+    padding:9px 18px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }
+  .ask-send:disabled { opacity:.5; }
+  .ask.answered { opacity:.6; }
+  .ask.answered .ask-opt, .ask.answered .ask-send { pointer-events:none; }
   .status { align-self:center; color:var(--muted); font-size:13px; }
   .ai pre, .ai code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   form { display:flex; gap:8px; padding:10px; background:var(--panel); border-top:1px solid #30363d;
@@ -110,6 +127,65 @@ function renderTool(bubble, msg) {
     });
   }
   enableCopy(el);
+  if (stick) scroll();
+  return el;
+}
+
+// 渲染 AskUserQuestion：每个问题一组可点选项按钮 + 一个"发送选择"按钮。
+// 单选点一下即选中（互斥）；多选可选多个。点发送 → POST /answer。
+function renderAsk(msg) {
+  const stick = atBottom();
+  const el = document.createElement('div');
+  el.className = 'bubble ask';
+  el.dataset.askId = msg.id;
+  const questions = Array.isArray(msg.questions) ? msg.questions : [];
+  // picks[i] = 第 i 题选中的 label 集合
+  const picks = questions.map(() => new Set());
+
+  questions.forEach((q, qi) => {
+    const multi = !!q.multiSelect;
+    const qEl = document.createElement('div'); qEl.className = 'ask-q'; qEl.textContent = q.question || '';
+    el.appendChild(qEl);
+    if (multi) { const h = document.createElement('div'); h.className='ask-hint'; h.textContent='（可多选）'; el.appendChild(h); }
+    const opts = document.createElement('div'); opts.className = 'ask-opts';
+    (q.options || []).forEach((o) => {
+      const label = typeof o === 'string' ? o : (o.label || '');
+      const desc = typeof o === 'string' ? '' : (o.description || '');
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'ask-opt';
+      const l = document.createElement('span'); l.className='lbl'; l.textContent = label; b.appendChild(l);
+      if (desc) { const d = document.createElement('span'); d.className='desc'; d.textContent = desc; b.appendChild(d); }
+      b.addEventListener('click', () => {
+        if (multi) {
+          if (picks[qi].has(label)) { picks[qi].delete(label); b.classList.remove('sel'); }
+          else { picks[qi].add(label); b.classList.add('sel'); }
+        } else {
+          picks[qi].clear(); picks[qi].add(label);
+          opts.querySelectorAll('.ask-opt').forEach(x => x.classList.remove('sel'));
+          b.classList.add('sel');
+        }
+        sendBtn.disabled = picks.some(s => s.size === 0);
+      });
+      opts.appendChild(b);
+    });
+    el.appendChild(opts);
+  });
+
+  const sendBtn = document.createElement('button');
+  sendBtn.type = 'button'; sendBtn.className = 'ask-send'; sendBtn.textContent = '发送选择';
+  sendBtn.disabled = true;   // 每题都选了才能发
+  sendBtn.addEventListener('click', async () => {
+    sendBtn.disabled = true; sendBtn.textContent = '提交中…';
+    const body = { id: msg.id, picks: picks.map(s => [...s]) };
+    try {
+      const r = await fetch(BASE + 'answer', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      el.classList.add('answered');   // 灰掉、锁住；服务端会广播 ask_answered/user 回显
+    } catch { sendBtn.disabled = false; sendBtn.textContent = '发送选择（重试）'; }
+  });
+  el.appendChild(sendBtn);
+
+  log.appendChild(el);
   if (stick) scroll();
   return el;
 }
@@ -197,6 +273,23 @@ function handle(msg) {
       const idx = toolPending.findIndex(p => p.name === msg.name);
       if (idx >= 0) { bubble = toolPending[idx].el; toolPending.splice(idx, 1); }
       renderTool(bubble, msg);
+      break;
+    }
+    case 'ask':
+      // Claude 在问选择题——渲染成可点选项。若已存在同 id 的（重连重放）先不重复加。
+      clearStatus(); aiBubble = null;
+      if (!log.querySelector('.ask[data-ask-id="' + msg.id + '"]')) renderAsk(msg);
+      break;
+    case 'ask_answered': {
+      // 已回答（可能是别的端答的/重放）——把对应问题卡片锁住变灰。
+      const a = log.querySelector('.ask[data-ask-id="' + msg.id + '"]');
+      if (a) a.classList.add('answered');
+      break;
+    }
+    case 'ask_clear': {
+      // 这一轮结束还没答（中断/报错）——撤下按钮，锁住。
+      const a = log.querySelector('.ask[data-ask-id="' + msg.id + '"]');
+      if (a) a.classList.add('answered');
       break;
     }
     case 'text_delta':
