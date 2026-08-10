@@ -131,12 +131,12 @@ let lastSigint = 0;
 async function postInterrupt() {
   try { await fetch(`http://127.0.0.1:${PORT}/${SECRET}/interrupt`, { method: "POST" }); } catch {}
 }
-async function postSend(text) {
+async function postSend(text, mode = "queue") {
   try {
     await fetch(`http://127.0.0.1:${PORT}/${SECRET}/send`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, mode }),
     });
   } catch (e) {
     console.log(`${C.red}   ⚠️ 发送失败：${e.message}${C.reset}`);
@@ -201,9 +201,9 @@ connect();
 const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 rl.on("line", (line) => {
   const text = line.trim();
-  if (!text) return;
   // 有待回答的选择题时，输入按"选项编号"解析并走 /answer；否则当普通消息发。
   if (termAsk) {
+    if (!text) return;
     const picks = parseAnswer(text, termAsk.questions);
     if (picks.every(p => p.length === 0)) {
       console.log(`${C.dim}   （没识别到有效编号；每题至少选一个，如 1 或 1,3 或 1;2）${C.reset}`);
@@ -214,7 +214,9 @@ rl.on("line", (line) => {
     postAnswer(id, picks);
     return;
   }
+  // 跟手机一致：有文字=排队插入（不打断）；空行=打断当前这轮。
   // 不在本地回显——server 会 broadcast 一个 user 事件，轮询拉回来由 render 统一显示，
   // 避免同一句话打印两次。
-  postSend(text);
+  if (!text) postSend("", "interrupt");
+  else postSend(text, "queue");
 });

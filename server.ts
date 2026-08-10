@@ -383,13 +383,14 @@ const server = createServer(async (req, res) => {
       text = String(text).trim();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
-      if (!text) return;
-      // mode=interrupt：像"打断重说"——先掐断当前这轮，清空还没跑的排队，再把新消息入队立即跑。
-      // mode=queue（默认）：贴近 CLI——不打断，排到当前轮后面，跑完自动接着处理。
-      if (mode === "interrupt" && running && currentAbort) {
+      // mode=interrupt：空白打断——掐断当前这轮 + 清空还没跑的排队，不发任何新内容。
+      // mode=queue：有文字——贴近 CLI，永远排到当前轮后面，跑完自动接着处理，从不打断。
+      if (mode === "interrupt") {
         QUEUE.length = 0;
-        currentAbort.abort();
+        if (running && currentAbort) currentAbort.abort();
+        return;
       }
+      if (!text) return;
       enqueuePrompt(text);
     });
     return;

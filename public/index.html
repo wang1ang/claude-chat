@@ -363,39 +363,27 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 // 电脑 CLI 后续写进 jsonl 的新内容，靠这个从头拉过来。
 conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; toolPending=[]; poll(); });
 
-// mode: 'queue'（默认，排队不打断）| 'interrupt'（打断重说，长按发送触发）
-async function send(mode) {
+// 有文字 = 永远排队插入（不打断）；空白（空/仅空格）= 打断当前轮。
+// mode 由内容决定：server 端 interrupt 只掐断、不入队新文字。
+async function send() {
   const text = ta.value.trim();
-  if (!text) return;
+  const mode = text ? 'queue' : 'interrupt';
   ta.value = ''; ta.style.height = 'auto';
   try {
-    setBusy(true);
-    // 具体排队/打断由 server 按 mode 处理；用户气泡也由 server 回显（入队即显示）。
+    if (mode === 'queue') setBusy(true);
+    // 排队/打断由 server 按 mode 处理；用户气泡也由 server 回显（入队即显示）。
     await fetch(BASE + 'send', { method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ text, mode: mode || 'queue' }) });
+      body: JSON.stringify({ text, mode }) });
   } catch { setBusy(false); addBubble('status','⚠️ 发送失败'); }
 }
 
-form.addEventListener('submit', (e) => { e.preventDefault(); send('queue'); });
+form.addEventListener('submit', (e) => { e.preventDefault(); send(); });
 // 手机上回车换行、点发送按钮提交；桌面 Enter 发送、Shift+Enter 换行
 ta.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !matchMedia('(pointer:coarse)').matches) {
-    e.preventDefault(); send('queue');
+    e.preventDefault(); send();
   }
 });
-// 长按发送按钮 = 打断重说（掐断当前轮 + 清空排队，立即发这条）。
-// 用一个标记：长按触发后，随之而来的 click（submit）就跳过，避免又按 queue 发一遍。
-let lpTimer = null, lpFired = false;
-function armLongPress() { lpFired = false; clearTimeout(lpTimer); lpTimer = setTimeout(() => { lpFired = true; if (navigator.vibrate) navigator.vibrate(30); send('interrupt'); }, 550); }
-function cancelLongPress() { clearTimeout(lpTimer); }
-btn.addEventListener('touchstart', armLongPress, { passive: true });
-btn.addEventListener('touchend', cancelLongPress);
-btn.addEventListener('touchmove', cancelLongPress, { passive: true });
-btn.addEventListener('mousedown', armLongPress);
-btn.addEventListener('mouseup', cancelLongPress);
-btn.addEventListener('mouseleave', cancelLongPress);
-// 若长按已触发过发送，吞掉紧接着的 click（表单 submit），避免重复发。
-btn.addEventListener('click', (e) => { if (lpFired) { e.preventDefault(); e.stopPropagation(); lpFired = false; } }, true);
 ta.addEventListener('input', () => { ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,120)+'px'; });
 </script>
 </body>
