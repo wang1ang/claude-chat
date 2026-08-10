@@ -22,15 +22,44 @@ const CWD = process.env.CHAT_CWD || process.cwd();
 // 一次只允许一条 prompt 在跑（MVP：单会话、单飞行）。
 let running = false;
 
-// ---- SSE 客户端集合：多个浏览器标签都能同时收到推流 ----
-type SSEClient = { write: (s: string) => void };
-const clients = new Set<SSEClient>();
+// ---- 事件缓冲：轮询模型（不用 SSE）----
+// 为什么不用 SSE：某些网络（公司 TLS 中间人代理）会缓冲流式响应，把 text/event-stream 这种
+// 永不结束的长连接整个憋住，手机端一个字节都收不到（首页短请求却能过）。改成轮询：
+// 所有事件追加进内存数组、各带递增 seq；前端每秒拉一次 /events?since=<seq> 取增量。短请求稳穿代理。
+type Ev = { seq: number; [k: string]: unknown };
+const EVENTS: Ev[] = [];
+let SEQ = 0;
+const MAX_EVENTS = 5000;   // 防止长时间运行内存无限涨；超了丢最老的（历史会在重连时重铺）
 
-function broadcast(obj: unknown) {
-  const line = `data: ${JSON.stringify(obj)}\n\n`;
-  for (const c of clients) {
-    try { c.write(line); } catch { /* 断开的客户端下次清理 */ }
-  }
+function broadcast(obj: any) {
+  EVENTS.push({ ...obj, seq: ++SEQ });
+  if (EVENTS.length > MAX_EVENTS) EVENTS.splice(0, EVENTS.length - MAX_EVENTS);
+}
+
+// 取 seq 之后的所有事件（since=0 或负数=从头，含刚铺的历史）
+function eventsSince(since: number): Ev[] {
+  if (since <= 0) return EVENTS.slice();
+  // EVENTS 按 seq 递增，二分找第一个 > since 的位置
+  let lo = 0, hi = EVENTS.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (EVENTS[m].seq <= since) lo = m + 1; else hi = m; }
+  return EVENTS.slice(lo);
+}
+
+// 首次拉取时把这段会话历史铺进事件流（只铺一次；用标记防重复铺）。
+// 手机上只需最近几轮就够，往前翻的历史暂不做懒加载——首拉只铺最近 HISTORY_TAIL 条，
+// 首屏轻、也省得 since=0 一次拉一大坨。
+const HISTORY_TAIL = 12;
+let historyLoaded = false;
+function ensureHistoryLoaded() {
+  if (historyLoaded) return;
+  historyLoaded = true;
+  if (!SESSION_ID) return;
+  const all = readHistory(SESSION_ID);
+  if (!all.length) return;
+  const hist = all.slice(-HISTORY_TAIL);
+  broadcast({ type: "history_start", count: hist.length, truncated: all.length > hist.length });
+  for (const ev of hist) broadcast(ev);
+  broadcast({ type: "history_end" });
 }
 
 // ---- 读取会话历史（.jsonl），转成一串可直接渲染的气泡事件 ----
@@ -207,28 +236,19 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && path === "/stream") {
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      "connection": "keep-alive",
-    });
-    res.write(": connected\n\n");
-    const client: SSEClient = { write: (s) => res.write(s) };
-    clients.add(client);
-    // 一进来就告诉前端当前会话状态
-    res.write(`data: ${JSON.stringify({ type: "hello", sessionId: SESSION_ID ?? null, running })}\n\n`);
-    // 再把这段会话的历史铺出来（只发给这个刚连上的客户端，不广播）
-    if (SESSION_ID) {
-      const hist = readHistory(SESSION_ID);
-      if (hist.length) {
-        res.write(`data: ${JSON.stringify({ type: "history_start", count: hist.length })}\n\n`);
-        for (const ev of hist) res.write(`data: ${JSON.stringify(ev)}\n\n`);
-        res.write(`data: ${JSON.stringify({ type: "history_end" })}\n\n`);
-      }
-    }
-    const ping = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 20000);
-    req.on("close", () => { clearInterval(ping); clients.delete(client); });
+  // 轮询取增量事件：GET /events?since=<seq> → { events:[...], seq:<最新seq>, running }
+  // 前端每秒拉一次；短请求能稳穿会憋死 SSE 长连接的代理。since=0 首拉会带上历史。
+  if (req.method === "GET" && path === "/events") {
+    ensureHistoryLoaded();   // 首次拉取时铺历史（幂等）
+    const since = Number(url.searchParams.get("since") ?? "0") || 0;
+    const evs = eventsSince(since);
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify({
+      events: evs,
+      seq: SEQ,
+      sessionId: SESSION_ID ?? null,
+      running,
+    }));
     return;
   }
 

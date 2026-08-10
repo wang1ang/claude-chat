@@ -104,6 +104,26 @@ fi
 
 # 暗号防护做在 Node 服务里：完整网址带 /<暗号>/ 前缀，根路径 404。
 FULL_URL="$URL/$SECRET/"
+
+# 关键：cloudflared 把网址打印出来 ≠ 隧道已经能用。
+# 有些网络（公司代理做 TLS 中间人）会让 edge 握手失败、反复重试，真正 Registered 要十几二十秒。
+# 这期间手机打开就是 530/空白——这正是"手机什么都看不到"的真凶。
+# 所以这里从公网这一侧探首页，直到真的 200（隧道活了）才把地址交给用户。
+echo -n "等隧道真正可用（穿透你的网络可能要十几秒）"
+READY=""
+for i in {1..60}; do
+  code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$FULL_URL")
+  if [ "$code" = "200" ]; then READY=1; break; fi
+  echo -n "."; sleep 1
+done
+echo ""
+if [ -z "$READY" ]; then
+  echo "⚠️  隧道 60 秒内还没稳定可用（你的网络对 cloudflared 拦得比较狠）。"
+  echo "   地址照样给你，但手机打开可能要多刷几次；实在不行看隧道日志：$CF_LOG"
+else
+  echo "✓ 隧道已可用，手机现在打开就能用。"
+fi
+
 echo ""
 echo "=============== 第 $N 份 · 手机浏览器打开（聊天框） ==============="
 echo "网址:   $FULL_URL"

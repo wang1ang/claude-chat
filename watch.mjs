@@ -76,35 +76,24 @@ function render(o) {
   }
 }
 
-// 简单 SSE 客户端（用内置 fetch 流式读，避免额外依赖）
+// 轮询客户端（跟前端同一套 /events?since= 协议；server 已去掉 SSE 改轮询）。
+// 电脑端跟看：每秒拉一次增量事件，render 出来。
 async function connect() {
-  const url = `http://127.0.0.1:${PORT}/${SECRET}/stream`;
+  const base = `http://127.0.0.1:${PORT}/${SECRET}/`;
+  let since = 0;
   for (;;) {
     try {
-      const res = await fetch(url);
-      if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
-          for (const line of chunk.split("\n")) {
-            if (line.startsWith("data:")) {
-              const s = line.slice(5).trim();
-              if (s) { try { render(JSON.parse(s)); } catch {} }
-            }
-          }
-        }
+      const res = await fetch(`${base}events?since=${since}`);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      for (const ev of data.events || []) {
+        if (ev.seq > since) since = ev.seq;
+        render(ev);
       }
     } catch (e) {
-      console.log(`${C.gray}（连接断开，2s 后重连… ${e.message}）${C.reset}`);
+      // 静默重试；只有持续失败才提示，别刷屏
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 1000));
   }
 }
 // Ctrl-C：第一次中断 claude 当前生成；1.5s 内再按一次 → 退出并全关（服务+隧道）。
@@ -142,4 +131,5 @@ process.on("SIGINT", () => {
 });
 
 console.log(`${C.dim}claude-chat 跟看中（只读）。Ctrl-C 中断当前生成；连按两次退出并全关。${C.reset}`);
+printUrl();   // 一进来先钉一遍网址（不再依赖 SSE 的 hello 事件；历史铺完 history_end 还会再钉）
 connect();

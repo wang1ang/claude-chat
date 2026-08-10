@@ -171,33 +171,42 @@ const BASE = (() => {
   return location.origin + p;   // 例：https://host/<secret>/
 })();
 
-// SSE：断了主动重连（不完全依赖 EventSource 自带的重连——手机锁屏/切后台/隧道换端口时
-// 它常卡在半死状态不自愈）。出错就关掉旧的、退避重连；切回前台立即重连。
-let es = null, reconnectTimer = null, backoff = 1000;
-function connect() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (es) { try { es.close(); } catch {} }
-  es = new EventSource(BASE + 'stream');
-  es.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch {} };
-  es.onopen = () => { conn.textContent = '已连接'; backoff = 1000; };
-  es.onerror = () => {
-    conn.textContent = '断开·重连中…';
-    try { es.close(); } catch {}
-    // 自己退避重连（1s→2s→…→最多 10s），别让它对着死连接空转
-    if (!reconnectTimer) {
-      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, backoff);
-      backoff = Math.min(backoff * 2, 10000);
+// 轮询取事件（不用 SSE）：某些网络（公司 TLS 中间人代理）会缓冲流式响应，把 SSE 长连接
+// 整个憋死——首页短请求能过，发消息后却一个字都收不到。改成每秒拉一次 /events?since=<seq>：
+// 短请求能稳穿代理。since 记着已收到的最大 seq，只取增量。
+let lastSeq = 0, polling = false, pollTimer = null, failStreak = 0;
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const r = await fetch(BASE + 'events?since=' + lastSeq, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    conn.textContent = '已连接';
+    failStreak = 0;
+    for (const ev of (data.events || [])) {
+      if (ev.seq > lastSeq) lastSeq = ev.seq;
+      handle(ev);
     }
-  };
+  } catch {
+    failStreak++;
+    conn.textContent = failStreak > 2 ? '连接中…' : '已连接';
+  } finally {
+    polling = false;
+  }
 }
-connect();
-// 手机从后台/锁屏切回来时，连接多半已死——立即重连拉最新历史
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && (!es || es.readyState === 2)) connect();
-});
-// 点右上角状态 = 手动刷新：重连 SSE 会让服务端重读 jsonl，把电脑上写进去的最新对话铺出来。
-// （claude-chat 只在连接那一刻读一次历史；电脑 CLI 后续写的新内容，靠这个刷新拉过来。）
-conn.addEventListener('click', () => { conn.textContent = '刷新中…'; connect(); });
+// 每秒一拉；页面在前台才拉，后台省电（切回来立即补一拉）
+function startPolling() {
+  if (pollTimer) return;
+  poll();
+  pollTimer = setInterval(() => { if (!document.hidden) poll(); }, 1000);
+}
+startPolling();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+// 点右上角状态 = 手动刷新：从头重拉一遍（重读 jsonl 历史 + 最新对话）。
+// 电脑 CLI 后续写进 jsonl 的新内容，靠这个从头拉过来。
+conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; poll(); });
 
 async function send() {
   const text = ta.value.trim();
