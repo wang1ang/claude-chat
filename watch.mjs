@@ -3,7 +3,7 @@
 // 上/下箭头翻历史、Option/Alt+←/→ 按单词跳，长段落自动折行由 Ink 负责，不再手搓光标序列。
 // 用法（由 claude-chat 调用）：PORT=.. SECRET=.. [FULL_URL=..] [PID_FILE=..] node watch.mjs
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, Static, useApp, useInput, useStdout } from "ink";
 import htm from "htm";
@@ -144,7 +144,10 @@ function shutdownAll() {
   // 2) 兜底按名清这一份的 server + cloudflared
   const kill = (pat) => { try { execSync(`pkill -f ${JSON.stringify(pat)}`, { stdio: "ignore" }); } catch {} };
   kill(`/claude-chat/server.ts`);
-  kill(`cloudflared tunnel --url http://127.0.0.1:${PORT}`);
+  // 注意：这里的模式要和启动脚本一致（含 --protocol http2），否则 pkill 匹配不到、隧道成孤儿。
+  kill(`cloudflared tunnel --protocol http2 --url http://127.0.0.1:${PORT}`);
+  // 3) 删掉自己的 pid 文件，别在 /tmp 里越堆越多（启动脚本按它占用来选端口号）。
+  try { unlinkSync(PID_FILE); } catch {}
 }
 
 // ── 事件 → 已定格的显示行（committed lines）────────────────────────────────
@@ -191,21 +194,47 @@ function App() {
     }
   };
 
-  // ── 轮询事件流 ──
+  // ── 轮询事件流（带看门狗）──
+  // 后端 server 若自己崩了/被杀，cloudflared 隧道还活着 → 手机对着空端口就是 502/Bad gateway。
+  // 这里连续多次拉不到本地 server 就判定后端已死，主动把这一份隧道也关掉并提示，
+  // 而不是让手机干等 502。（DEAD_AFTER 次 × 500ms ≈ 判定阈值）
   useEffect(() => {
     let since = 0; let alive = true;
+    let fails = 0;
+    const DEAD_AFTER = 20;   // ~10s 连不上就认定后端挂了
+    let bootstrapped = false; // 至少成功连过一次，才允许触发"后端已死"（避免启动竞态误杀）
     (async () => {
       while (alive) {
         try {
-          const res = await fetch(`${BASE}events?since=${since}`);
+          // 带超时：后端若"接受连接但不回应"（卡死/半死），fetch 不加超时会一直挂着，
+          // 看门狗永远等不到失败。3s 收不到就当这次失败。
+          const res = await fetch(`${BASE}events?since=${since}`, { signal: AbortSignal.timeout(3000) });
           if (res.ok) {
+            bootstrapped = true; fails = 0;
             const data = await res.json();
             for (const ev of data.events || []) {
               if (ev.seq > since) since = ev.seq;
               handle(ev);
             }
+          } else {
+            fails++;
           }
-        } catch {}
+        } catch { fails++; }
+        // 曾连上过、之后又连续拉不到 → 后端死了，收拾残局免得留孤儿隧道让手机 502。
+        if (bootstrapped && fails >= DEAD_AFTER) {
+          alive = false;
+          const sid = sessionIdRef.current;
+          exit();
+          setTimeout(() => {
+            process.stdout.write(
+              `\n⚠️ 本地后端 server 已不可用（可能崩了或被杀），已关闭隧道以免手机一直 502。\n`
+            );
+            if (sid) process.stdout.write(`重新连接这段会话:\n  claude-chat ${sid}\n\n`);
+            shutdownAll();
+            process.exit(1);
+          }, 50);
+          return;
+        }
         await new Promise((r) => setTimeout(r, 500));
       }
     })();
