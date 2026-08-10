@@ -299,4 +299,7 @@ function App() {
   `;
 }
 
-render(html`<${App} />`);
+// exitOnCtrlC:false —— 关掉 Ink 默认的「按一次 Ctrl-C 立刻退出」。
+// 否则 Ink 自己会在第一次 Ctrl-C 就退出，且 useInput 对 ctrl+c 直接跳过不回调，
+// 我们「先中断这轮、1.5s 内再按一次才全退」的逻辑根本收不到键。
+render(html`<${App} />`, { exitOnCtrlC: false });
