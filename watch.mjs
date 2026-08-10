@@ -33,7 +33,7 @@ function wordRight(cps, cursor) {
   return i;
 }
 
-function Input({ value, onChange, onSubmit, focus = true, promptWidth = 0, baseLine = 0 }) {
+function Input({ value, onChange, onSubmit, focus = true, prompt = "", promptWidth = 0, baseLine = 0 }) {
   const cps = [...value];                          // 按码点切，索引即光标位置
   const [cursor, setCursor] = useState(cps.length);
   const cur = Math.max(0, Math.min(cursor, cps.length));
@@ -88,22 +88,26 @@ function Input({ value, onChange, onSubmit, focus = true, promptWidth = 0, baseL
   const atChar = cur < cps.length ? cps[cur] : " ";
   const after = cur < cps.length ? cps.slice(cur + 1).join("") : "";
 
+  // focus 时**一直**钉真实终端光标到输入位——包括输入为空时。
+  // 中文输入法的未上屏拼音串是画在**真实光标**处的：空输入时若把光标交还 Ink
+  // （setCursorPosition(undefined)），Ink 不把光标定到 你 ▸ 后，而是留在重画区原点（列 0），
+  // 拼音就从列 0 顶格画、和上面的 你 ▸ 分成两行——只有走输入法、且拼音还没上屏（value 空）时才犯。
+  // 早先空输入交还 Ink 是为治「流式输出时候选框被往上拽」，那其实是 baseLine 抖动，现已算准，可放心常钉。
   if (focus) {
-    // focus 时用**真实**终端光标（下面 setCursorPosition），不再额外反显一个假光标——
-    // 否则真假两个光标同时可见（上下两个光标）。blur 时才反显，让人看到光标停在哪。
-    //
-    // 算真光标的位置。useCursor 的 y 相对**动态重画区**顶部（<Static> 提交的历史行不计入）。
+    // useCursor 的 y 相对**动态重画区**顶部（<Static> 提交的历史行不计入）。
     // baseLine = 输入块上方的动态行数（live/status/askView，由父组件算好传入）。
     // 输入超出终端宽度会折行，按列宽把「绝对列」拆成「第几折行 + 该行第几列」：
-    // cells = 提示符宽 + 前置文本显示宽（中文占 2 列），curLine = floor(curCells/cols)。
+    // cells = 提示符宽 + 光标前文本显示宽（中文占 2 列）。
     const cols = Math.max(1, process.stdout.columns || 80);
     const curCells = promptWidth + stringWidth(before);
     setCursorPosition({ x: curCells % cols, y: baseLine + Math.floor(curCells / cols) });
-    return html`<${Text}>${value}<//>`;
+    // 提示符和输入文本同一个 <Text>——超宽时连续折行，提示符不会被落单在上一行。
+    return html`<${Text}><${Text} color="green" bold>${prompt}<//>${value}<//>`;
   }
 
+  // 未 focus：不占用真实光标，反显一个占位好看到落点。
   setCursorPosition(undefined);
-  return html`<${Text}>${before}<${Text} inverse>${atChar}<//>${after}<//>`;
+  return html`<${Text}><${Text} color="green" bold>${prompt}<//>${before}<${Text} inverse>${atChar}<//>${after}<//>`;
 }
 
 // 输入提示符 "你 ▸ " 的显示宽度（中文 2 列）——用它算真实光标的起始列。
@@ -411,7 +415,18 @@ function App() {
   // 输入块上方的动态行数——喂给 <Input> 定位真实光标（IME 候选框跟手）。
   // <Static> 提交的历史行不参与每帧重画、不计入；只数下面这些动态块的折行。
   const cols = Math.max(1, stdout?.columns || 80);
-  const wrapLines = (text, prefixW = 0) => Math.max(1, Math.floor((prefixW + stringWidth(text)) / cols) + 1);
+  // 数一块文本渲染后占几行终端。先按 \n 拆成逻辑行——不拆的话多行内容会被当成一行，
+  // baseLine 少算，钉的真光标（连带 IME 候选框）就浮到 live 块顶部去了。
+  // 每逻辑行再按列宽折行；prefixW（如 "Claude ◂ "）只加在第一行。
+  const wrapLines = (text, prefixW = 0) => {
+    const parts = String(text).split("\n");
+    let n = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const w = (i === 0 ? prefixW : 0) + stringWidth(parts[i]);
+      n += Math.max(1, Math.ceil(w / cols));         // 空行(w=0)也占 1 行；满行按整除折
+    }
+    return n;
+  };
   let baseLine = 0;
   if (live) baseLine += wrapLines(live, stringWidth("Claude ◂ "));
   if (askView) {
@@ -436,7 +451,7 @@ function App() {
           <//>
         `}
       <//>
-      ${live ? html`<${Box}><${Text} color="cyan" bold>Claude ◂ <//><${Text}>${live}<//><//>` : null}
+      ${live ? html`<${Box}><${Text}><${Text} color="cyan" bold>Claude ◂ <//>${live}<//><//>` : null}
       ${askView ? html`
         <${Box} flexDirection="column" marginTop=${1}>
           <${Text} color="yellow" bold>❓ Claude 在提问（回复选项编号，多题用 ; 分隔，多选用逗号）：<//>
@@ -455,8 +470,7 @@ function App() {
       ` : null}
       ${status ? html`<${Box}><${Text} color="gray">… ${status}<//><//>` : null}
       <${Box}>
-        <${Text} color="green" bold>${PROMPT}<//>
-        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} promptWidth=${PROMPT_WIDTH} baseLine=${baseLine} />
+        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} prompt=${PROMPT} promptWidth=${PROMPT_WIDTH} baseLine=${baseLine} />
       <//>
     <//>
   `;
