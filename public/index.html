@@ -230,6 +230,63 @@ function enableCopy(el) {
   el.addEventListener('dblclick', () => copyBubble(el));   // 桌面双击复制
 }
 
+// ── 往前翻加载更早历史（滑到顶自动拉上一页）──────────────────────────────
+// 游标 histBefore = 服务端 HISTORY_CACHE 里"当前已显示最早那条"的下标；
+// null 表示还没铺过历史（用服务端默认）。histHasMore=false 表示已到最顶、别再拉。
+let histBefore = null, histHasMore = true, histLoading = false;
+
+// 把一条历史事件渲染成一个"脱离文档"的气泡元素（不 append 到底部，供 prepend 用）。
+// readHistory 只产出 user / ai / tool_use 三种，这里对齐它们的样式。
+function buildOlderBubble(msg) {
+  if (msg.type === 'tool_use') {
+    const d = document.createElement('div'); d.className = 'bubble tool';
+    const title = document.createElement('div'); title.className = 'tool-title';
+    title.textContent = '🔧 ' + msg.name + (msg.summary ? ' · ' + msg.summary : '');
+    d.appendChild(title);
+    const input = msg.input && Object.keys(msg.input).length ? msg.input : null;
+    if (input) {
+      const detail = document.createElement('pre'); detail.className = 'tool-detail';
+      try { detail.textContent = JSON.stringify(input, null, 2); } catch { detail.textContent = String(input); }
+      detail.style.display = 'none'; d.appendChild(detail);
+      title.classList.add('tappable');
+      title.addEventListener('click', () => { detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; });
+    }
+    enableCopy(d); return d;
+  }
+  const cls = msg.type === 'user' ? 'me' : 'ai';
+  const d = document.createElement('div'); d.className = 'bubble ' + cls; d.textContent = msg.text || '';
+  enableCopy(d); return d;
+}
+
+async function loadOlder() {
+  if (histLoading || !histHasMore) return;
+  histLoading = true;
+  try {
+    const q = histBefore == null ? '' : ('?before=' + histBefore);
+    const r = await fetch(BASE + 'history' + q, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const evs = data.events || [];
+    if (evs.length) {
+      // 保持滚动位置不跳：prepend 前记高度，prepend 后按差值补回 scrollTop。
+      const before = log.scrollHeight, prevTop = log.scrollTop;
+      const frag = document.createDocumentFragment();
+      for (const ev of evs) frag.appendChild(buildOlderBubble(ev));   // evs 是时间正序
+      log.insertBefore(frag, log.firstChild);
+      log.scrollTop = prevTop + (log.scrollHeight - before);
+    }
+    histBefore = data.before;
+    histHasMore = !!data.hasMore;
+  } catch {
+    // 静默失败，下次滑到顶再试
+  } finally {
+    histLoading = false;
+  }
+}
+
+// 滑到接近顶部时自动拉上一页。
+log.addEventListener('scroll', () => { if (log.scrollTop < 60) loadOlder(); }, { passive: true });
+
 function handle(msg) {
   switch (msg.type) {
     case 'hello':
@@ -241,6 +298,8 @@ function handle(msg) {
     case 'history_start':
       // 清空当前所有气泡，重新铺历史（防重连重复）
       log.innerHTML = ''; aiBubble = null; statusEl = null; toolPending = [];
+      // 重置往前翻的游标：这次首屏铺的是最近一页，更早的等滑到顶再拉。
+      histBefore = null; histHasMore = (msg.truncated !== false); histLoading = false;
       break;
     case 'ai':
       // 历史里的整条 AI 文字（不是增量）
@@ -365,7 +424,7 @@ startPolling();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 // 点右上角状态 = 手动刷新：从头重拉一遍（重读 jsonl 历史 + 最新对话）。
 // 电脑 CLI 后续写进 jsonl 的新内容，靠这个从头拉过来。
-conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; toolPending=[]; poll(); });
+conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; toolPending=[]; histBefore=null; histHasMore=true; histLoading=false; poll(); });
 
 // 有文字 = 永远排队插入（不打断）；空白（空/仅空格）= 打断当前轮。
 // mode 由内容决定：server 端 interrupt 只掐断、不入队新文字。

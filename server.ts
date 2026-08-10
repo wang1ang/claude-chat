@@ -106,21 +106,37 @@ function eventsSince(since: number): Ev[] {
   return EVENTS.slice(lo);
 }
 
-// 首次拉取时把这段会话历史铺进事件流（只铺一次；用标记防重复铺）。
-// 手机上只需最近几轮就够，往前翻的历史暂不做懒加载——首拉只铺最近 HISTORY_TAIL 条，
-// 首屏轻、也省得 since=0 一次拉一大坨。
+// 首次拉取时把最近 HISTORY_TAIL 条历史铺进事件流（只铺一次，首屏轻）。
+// 更早的历史支持懒加载：前端滑到顶时调 GET /history?before=<idx> 往前再取一页。
+// 分页游标 = 解析后历史数组（HISTORY_CACHE）的下标：首屏铺的是 [firstShownIdx, len)，
+// 再往前就取 [max(0, before-limit), before)。
 const HISTORY_TAIL = 12;
+const HISTORY_PAGE = 20;   // 每次往前翻加载多少条
 let historyLoaded = false;
+let HISTORY_CACHE: any[] = [];   // 首拉时缓存整段解析结果，供 /history 分页复用
+let firstShownIdx = 0;           // 已经铺给前端的最早那条在 HISTORY_CACHE 里的下标
 function ensureHistoryLoaded() {
   if (historyLoaded) return;
   historyLoaded = true;
   if (!SESSION_ID) return;
-  const all = readHistory(SESSION_ID);
+  HISTORY_CACHE = readHistory(SESSION_ID);
+  const all = HISTORY_CACHE;
   if (!all.length) return;
-  const hist = all.slice(-HISTORY_TAIL);
-  broadcast({ type: "history_start", count: hist.length, truncated: all.length > hist.length });
+  firstShownIdx = Math.max(0, all.length - HISTORY_TAIL);
+  const hist = all.slice(firstShownIdx);
+  broadcast({ type: "history_start", count: hist.length, truncated: firstShownIdx > 0 });
   for (const ev of hist) broadcast(ev);
   broadcast({ type: "history_end" });
+}
+
+// 往前取一页更早的历史。before 省略时用 firstShownIdx（"当前最早那条之前"）。
+// 返回 { events, hasMore, before }：events 是更早的一批（时间正序），
+// before 是这一批里最早那条的下标——前端下次把它当 before 再往前翻。
+function olderHistory(beforeArg: number | null) {
+  const before = beforeArg == null ? firstShownIdx : Math.max(0, Math.min(beforeArg, HISTORY_CACHE.length));
+  const start = Math.max(0, before - HISTORY_PAGE);
+  const events = HISTORY_CACHE.slice(start, before);
+  return { events, hasMore: start > 0, before: start };
 }
 
 // ---- 读取会话历史（.jsonl），转成一串可直接渲染的气泡事件 ----
@@ -371,6 +387,18 @@ const server = createServer(async (req, res) => {
       sessionId: SESSION_ID ?? null,
       running,
     }));
+    return;
+  }
+
+  // 懒加载更早的历史：GET /history?before=<idx> → { events, hasMore, before }
+  // 前端滑到顶时调用；把 events 逆着 prepend 到列表顶部，用返回的 before 作下次游标。
+  if (req.method === "GET" && path === "/history") {
+    ensureHistoryLoaded();   // 保证 HISTORY_CACHE 已就绪
+    const raw = url.searchParams.get("before");
+    const before = raw == null || raw === "" ? null : (Number(raw) || 0);
+    const { events, hasMore, before: nextBefore } = olderHistory(before);
+    res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    res.end(JSON.stringify({ events, hasMore, before: nextBefore }));
     return;
   }
 
