@@ -111,11 +111,15 @@ FULL_URL="$URL/$SECRET/"
 # 所以这里从公网这一侧探首页，直到真的 200（隧道活了）才把地址交给用户。
 echo -n "等隧道真正可用（穿透你的网络可能要十几秒）"
 READY=""
+# 探测期间局部关掉 set -e：隧道没 Registered 时 curl 会连不上返回非零，
+# set -e 下会让脚本当场静默 exit、后台进程僵留，表现为「命令行直接退出」。这是必须的。
+set +e
 for i in {1..60}; do
-  code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$FULL_URL")
+  code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$FULL_URL" 2>/dev/null)
   if [ "$code" = "200" ]; then READY=1; break; fi
   echo -n "."; sleep 1
 done
+set -e
 echo ""
 if [ -z "$READY" ]; then
   echo "⚠️  隧道 60 秒内还没稳定可用（你的网络对 cloudflared 拦得比较狠）。"
