@@ -5,7 +5,8 @@
 import { execSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import React, { useState, useEffect, useRef } from "react";
-import { render, Box, Text, Static, useApp, useInput, useStdout } from "ink";
+import { render, Box, Text, Static, useApp, useInput, useStdout, useCursor } from "ink";
+import stringWidth from "string-width";
 import htm from "htm";
 
 const html = htm.bind(React.createElement);
@@ -32,10 +33,11 @@ function wordRight(cps, cursor) {
   return i;
 }
 
-function Input({ value, onChange, onSubmit, focus = true }) {
+function Input({ value, onChange, onSubmit, focus = true, promptWidth = 0 }) {
   const cps = [...value];                          // 按码点切，索引即光标位置
   const [cursor, setCursor] = useState(cps.length);
   const cur = Math.max(0, Math.min(cursor, cps.length));
+  const { setCursorPosition } = useCursor();       // 把**真实**终端光标移到输入位，让中文输入法候选框跟手
 
   const setBoth = (nextCps, nextCursor) => {
     setCursor(nextCursor);
@@ -86,8 +88,20 @@ function Input({ value, onChange, onSubmit, focus = true }) {
   const before = cps.slice(0, cur).join("");
   const atChar = cur < cps.length ? cps[cur] : " ";
   const after = cur < cps.length ? cps.slice(cur + 1).join("") : "";
+
+  // 把真实终端光标移到光标处：x = 提示符宽 + 光标前文本的显示宽度（中文按 2 列），
+  // y 给一个大值——Ink 会 clamp 到帧底那一行（输入框恒在最后一行）。这样系统输入法的
+  // 候选框就跟着光标走，而不再固定飘在屏幕左下角。focus 时才占用真实光标。
+  if (focus) setCursorPosition({ x: promptWidth + stringWidth(before), y: 9999 });
+  else setCursorPosition(undefined);
+
   return html`<${Text}>${before}<${Text} inverse>${atChar}<//>${after}<//>`;
 }
+
+// 输入提示符 "你 ▸ " 的显示宽度（中文 2 列）——用它算真实光标的起始列。
+// 从常量算，改提示符时这里自动跟着变。
+const PROMPT = "你 ▸ ";
+const PROMPT_WIDTH = stringWidth(PROMPT);
 
 const PORT = process.env.PORT;
 const SECRET = process.env.SECRET;
@@ -416,8 +430,8 @@ function App() {
       ` : null}
       ${status ? html`<${Box}><${Text} color="gray">… ${status}<//><//>` : null}
       <${Box}>
-        <${Text} color="green" bold>你 ▸ <//>
-        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} />
+        <${Text} color="green" bold>${PROMPT}<//>
+        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} promptWidth=${PROMPT_WIDTH} />
       <//>
     <//>
   `;
