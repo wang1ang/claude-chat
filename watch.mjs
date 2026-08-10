@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 const PORT = process.env.PORT;
 const SECRET = process.env.SECRET;
+const FULL_URL = process.env.FULL_URL || "";
 if (!PORT || !SECRET) { console.error("缺 PORT/SECRET"); process.exit(1); }
 
 const C = {
@@ -17,10 +18,21 @@ let inHistory = false;
 
 function endAI() { if (aiOpen) { process.stdout.write("\n"); aiOpen = false; } }
 
+// 把手机网址钉一遍——醒目高亮，免得被历史回放刷走看不到。
+function printUrl() {
+  if (!FULL_URL) return;
+  const bar = "═".repeat(Math.max(20, FULL_URL.length + 6));
+  console.log(`${C.yellow}${C.bold}${bar}${C.reset}`);
+  console.log(`${C.yellow}${C.bold}  📱 手机浏览器打开（末尾暗号不能少）:${C.reset}`);
+  console.log(`${C.cyan}${C.bold}  ${FULL_URL}${C.reset}`);
+  console.log(`${C.yellow}${C.bold}${bar}${C.reset}`);
+}
+
 function render(o) {
   switch (o.type) {
     case "hello":
       console.log(`${C.dim}── 已连接跟看${o.sessionId ? "，会话 " + o.sessionId.slice(0, 8) : "（新会话）"} ──${C.reset}`);
+      printUrl();
       break;
     case "history_start":
       inHistory = true;
@@ -29,6 +41,7 @@ function render(o) {
     case "history_end":
       inHistory = false;
       console.log(`${C.dim}┄┄ 以上为历史，下面是实时 ┄┄${C.reset}`);
+      printUrl();   // 历史刷完再钉一遍，网址就在最新位置、不会被顶走
       break;
     case "user":
       endAI();

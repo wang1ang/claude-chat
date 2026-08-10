@@ -117,5 +117,7 @@ echo ""
 echo "第 $N 份(chat): $FULL_URL  会话:${SESSION_ID:-新}" >> ~/.claude-web-urls
 
 # 当前终端直接变成只读跟看视图（前台）。
+# 把网址传进 watch，让它在历史回放前后各钉一遍，免得被历史刷走看不到。
 # Ctrl-C：一次中断当前生成；1.5s 内连按两次 → 退出并全关服务+隧道。
-exec env PORT="$PORT" SECRET="$SECRET" PID_FILE="$PID_FILE" "$NODE" "$APP_DIR/watch.mjs"
+exec env PORT="$PORT" SECRET="$SECRET" PID_FILE="$PID_FILE" FULL_URL="$FULL_URL" \
+  "$NODE" "$APP_DIR/watch.mjs"
