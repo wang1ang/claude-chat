@@ -12,10 +12,20 @@ set -e
 # 项目目录：默认取本脚本（bin/claude-chat）所在仓库根。
 # 若你把脚本 symlink 到别处，用 CLAUDE_CHAT_DIR 覆盖，或直接改成绝对路径。
 APP_DIR="${CLAUDE_CHAT_DIR:-${0:A:h:h}}"   # 脚本绝对路径的上两级（bin/ 的父目录=仓库根）
-CFD=/opt/homebrew/bin/cloudflared
+CFD=$(command -v cloudflared)              # 自动找 cloudflared（brew/apt/手装都行）
 NODE=$(command -v node)
 NPX=$(command -v npx)
 BASE_PORT=8790
+
+if [ -z "$CFD" ]; then
+  echo "❌ 没找到 cloudflared。装一下："
+  echo "     macOS:  brew install cloudflared"
+  echo "     Linux:  见 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+  exit 1
+fi
+if [ -z "$NODE" ] || [ -z "$NPX" ]; then
+  echo "❌ 没找到 node/npx，先装 Node.js 18+（https://nodejs.org 或 brew install node）。"; exit 1
+fi
 
 # ── Bedrock 环境：强制重置成干净的那套。
 # 当前 shell 可能被其他工具改过 AWS 环境变量（静态 key / 别的 region），会顶掉
