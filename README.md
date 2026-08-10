@@ -23,6 +23,39 @@ Claude 进程 I/O 绑死在启动它的 TTY 上，没法被别的程序塞消息
 - 启动脚本（`bin/claude-chat`）：起服务 + cloudflared 隧道 + 生成暗号，打印带暗号完整网址，
   然后 `exec` 进跟看视图。
 
+## 安装
+
+```bash
+# 1) 拿到代码
+git clone <this-repo> ~/models/claude-chat
+cd ~/models/claude-chat
+
+# 2) 装 Node 依赖（@anthropic-ai/claude-agent-sdk + tsx）
+npm install
+
+# 3) 装 cloudflared（quick tunnel，无需账号）
+brew install cloudflared          # macOS；其它平台见 cloudflared 官方文档
+
+# 4) 让 claude-chat 命令可用：把启动脚本软链进 PATH
+ln -s "$PWD/bin/claude-chat" ~/.local/bin/claude-chat   # 确保 ~/.local/bin 在 $PATH 里
+# 或者直接 export PATH="$PWD/bin:$PATH"
+```
+
+**换机必改**：`bin/claude-chat` 开头有两行按作者本机写死的路径，clone 到别的机器后要改成你自己的：
+
+```sh
+APP_DIR=/Users/yang.wang/.local/claude-chat   # 改成你的项目目录，例：$HOME/models/claude-chat
+CFD=/opt/homebrew/bin/cloudflared             # 改成 `which cloudflared` 的结果
+```
+
+（`node`/`npx` 脚本会自己 `command -v` 找，不用改。AWS Bedrock 那段见下方「后端认证」。）
+
+验证：
+
+```bash
+claude-chat        # 应打印带暗号的手机网址，并进入只读跟看视图；Ctrl-C 两次退出
+```
+
 ## 用法
 
 ```bash
@@ -42,13 +75,12 @@ claude-chat --model <model> <id>     # 指定模型（可选）
 
 ## 依赖
 
-- Node.js（内置 fetch，用于 watch.mjs 的 SSE）
-- `@anthropic-ai/claude-agent-sdk`、`tsx`（`npm install`）
+- Node.js 18+（用到内置 `fetch`；watch.mjs 的 SSE 客户端依赖它）
+- `@anthropic-ai/claude-agent-sdk`、`tsx`（由 `npm install` 装上）
 - [`cloudflared`](https://github.com/cloudflare/cloudflared)（quick tunnel，无需账号）
+- zsh（启动脚本用 `#!/bin/zsh`）
 
-```bash
-npm install
-```
+安装步骤见上方「安装」。
 
 ## 后端认证（AWS Bedrock）
 
