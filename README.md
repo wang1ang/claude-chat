@@ -64,7 +64,7 @@ claude-chat
 
 ---
 
-## 二、怎么跑（给人看）
+## 二、怎么跑
 
 ```bash
 claude-chat                          # 新开一段对话
