@@ -33,7 +33,7 @@ function wordRight(cps, cursor) {
   return i;
 }
 
-function Input({ value, onChange, onSubmit, focus = true, promptWidth = 0 }) {
+function Input({ value, onChange, onSubmit, focus = true, promptWidth = 0, baseLine = 0 }) {
   const cps = [...value];                          // 按码点切，索引即光标位置
   const [cursor, setCursor] = useState(cps.length);
   const cur = Math.max(0, Math.min(cursor, cps.length));
@@ -84,17 +84,25 @@ function Input({ value, onChange, onSubmit, focus = true, promptWidth = 0 }) {
     }
   }, { isActive: focus });
 
-  // 反显一个假光标（和 ink-text-input 一样的做法，但按码点渲染）。
   const before = cps.slice(0, cur).join("");
   const atChar = cur < cps.length ? cps[cur] : " ";
   const after = cur < cps.length ? cps.slice(cur + 1).join("") : "";
 
-  // 把真实终端光标移到光标处：x = 提示符宽 + 光标前文本的显示宽度（中文按 2 列），
-  // y 给一个大值——Ink 会 clamp 到帧底那一行（输入框恒在最后一行）。这样系统输入法的
-  // 候选框就跟着光标走，而不再固定飘在屏幕左下角。focus 时才占用真实光标。
-  if (focus) setCursorPosition({ x: promptWidth + stringWidth(before), y: 9999 });
-  else setCursorPosition(undefined);
+  if (focus) {
+    // focus 时用**真实**终端光标（下面 setCursorPosition），不再额外反显一个假光标——
+    // 否则真假两个光标同时可见（上下两个光标）。blur 时才反显，让人看到光标停在哪。
+    //
+    // 算真光标的位置。useCursor 的 y 相对**动态重画区**顶部（<Static> 提交的历史行不计入）。
+    // baseLine = 输入块上方的动态行数（live/status/askView，由父组件算好传入）。
+    // 输入超出终端宽度会折行，按列宽把「绝对列」拆成「第几折行 + 该行第几列」：
+    // cells = 提示符宽 + 前置文本显示宽（中文占 2 列），curLine = floor(curCells/cols)。
+    const cols = Math.max(1, process.stdout.columns || 80);
+    const curCells = promptWidth + stringWidth(before);
+    setCursorPosition({ x: curCells % cols, y: baseLine + Math.floor(curCells / cols) });
+    return html`<${Text}>${value}<//>`;
+  }
 
+  setCursorPosition(undefined);
   return html`<${Text}>${before}<${Text} inverse>${atChar}<//>${after}<//>`;
 }
 
@@ -400,6 +408,23 @@ function App() {
   const color = { user: "green", ai: "cyan", tool: "yellow", err: "red", dim: "gray", sep: "gray", hint: "gray", url: "yellow", urlval: "cyan" };
   const rows = stdout?.rows || 24;
 
+  // 输入块上方的动态行数——喂给 <Input> 定位真实光标（IME 候选框跟手）。
+  // <Static> 提交的历史行不参与每帧重画、不计入；只数下面这些动态块的折行。
+  const cols = Math.max(1, stdout?.columns || 80);
+  const wrapLines = (text, prefixW = 0) => Math.max(1, Math.floor((prefixW + stringWidth(text)) / cols) + 1);
+  let baseLine = 0;
+  if (live) baseLine += wrapLines(live, stringWidth("Claude ◂ "));
+  if (askView) {
+    baseLine += 1;                                   // marginTop=1
+    baseLine += 1;                                   // 标题行
+    for (const q of askView.questions) {
+      baseLine += 1;                                 // Q 行
+      baseLine += (q.options || []).length;          // 每个选项一行
+    }
+    baseLine += 1;                                   // 例子提示行
+  }
+  if (status) baseLine += 1;
+
   return html`
     <${Box} flexDirection="column">
       <${Static} items=${lines}>
@@ -431,7 +456,7 @@ function App() {
       ${status ? html`<${Box}><${Text} color="gray">… ${status}<//><//>` : null}
       <${Box}>
         <${Text} color="green" bold>${PROMPT}<//>
-        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} promptWidth=${PROMPT_WIDTH} />
+        <${Input} value=${input} onChange=${setInput} onSubmit=${onSubmit} promptWidth=${PROMPT_WIDTH} baseLine=${baseLine} />
       <//>
     <//>
   `;
