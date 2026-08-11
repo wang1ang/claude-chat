@@ -423,15 +423,13 @@ function App() {
     const text = value.trim();
     setInput("");
     histIdxRef.current = -1; draftRef.current = "";
-    // 待回答选择题：按编号解析走 /answer
+    // 待回答选择题：先按编号解析走 /answer；识别不到有效编号就把整段当自由文字答案
+    // （传 [[text]]，后端 join 后即原文）——跟手机端一致，别卡着逼用户输编号。
     const ask = askRef.current;
     if (ask) {
       if (!text) return;
-      const picks = parseAnswer(text, ask.questions);
-      if (picks.every((p) => p.length === 0)) {
-        setStatus("没识别到有效编号；每题至少选一个，如 1 或 1,3 或 1;2");
-        return;
-      }
+      let picks = parseAnswer(text, ask.questions);
+      if (picks.every((p) => p.length === 0)) picks = [[text]];   // 自由文字回答
       const id = ask.id;
       askRef.current = null; setAskView(null);
       postAnswer(id, picks).then((err) => { if (err) pushLine("err", "⚠️ 回答失败：" + err); });
