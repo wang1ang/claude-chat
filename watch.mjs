@@ -50,6 +50,13 @@ function Input({ value, onChange, onSubmit, focus = true, prompt = "", promptWid
     // 交回父组件处理的键：不动、直接放行。
     if (key.upArrow || key.downArrow || (key.ctrl && input === "c")) return;
 
+    // Shift+Enter = 在光标处插换行（不提交）；普通 Enter = 提交。
+    // 依赖 Kitty keyboard protocol（启动时已 push CSI>1u），否则终端把两者都发成 \r，
+    // Ink 读到的 key.shift 恒为 false → 退化成「Enter 直接发送」，功能自然降级、不报错。
+    if (key.return && key.shift) {
+      setBoth([...cps.slice(0, cur), "\n", ...cps.slice(cur)], cur + 1);
+      return;
+    }
     if (key.return) { onSubmit?.(value); return; }
 
     // Option/Alt 词跳：macOS 默认 Option+←/→ 发 ESC b / ESC f（input=b/f + meta），
@@ -98,12 +105,23 @@ function Input({ value, onChange, onSubmit, focus = true, prompt = "", promptWid
   if (focus) {
     // useCursor 的 y 相对**动态重画区**顶部（<Static> 提交的历史行不计入）。
     // baseLine = 输入块上方的动态行数（live/status/askView，由父组件算好传入）。
-    // 输入超出终端宽度会折行，按列宽把「绝对列」拆成「第几折行 + 该行第几列」：
-    // cells = 提示符宽 + 光标前文本显示宽（中文占 2 列）。
+    // 多行输入（Shift+Enter 插了 \n）：光标前文本按 \n 拆逻辑行——
+    //   y 加上「前面完整逻辑行各自的折行数」＋「当前逻辑行内的折行数」；
+    //   x 是当前逻辑行内、光标前那截的显示宽 % cols。
+    //   提示符宽只算在第一逻辑行（其余逻辑行顶格，无提示符）。
     const cols = Math.max(1, process.stdout.columns || 80);
-    const curCells = promptWidth + stringWidth(before);
-    setCursorPosition({ x: curCells % cols, y: baseLine + Math.floor(curCells / cols) });
+    const bParts = before.split("\n");
+    let y = baseLine;
+    for (let i = 0; i < bParts.length - 1; i++) {           // 完整逻辑行（光标不在其内）
+      const w = (i === 0 ? promptWidth : 0) + stringWidth(bParts[i]);
+      y += Math.max(1, Math.ceil(w / cols));                // 空行也占 1 行
+    }
+    const lastIdx = bParts.length - 1;
+    const lastCells = (lastIdx === 0 ? promptWidth : 0) + stringWidth(bParts[lastIdx]);
+    y += Math.floor(lastCells / cols);
+    setCursorPosition({ x: lastCells % cols, y });
     // 提示符和输入文本同一个 <Text>——超宽时连续折行，提示符不会被落单在上一行。
+    // value 里的 \n 交给 Ink 自然分行渲染。
     return html`<${Text}><${Text} color="green" bold>${prompt}<//>${value}<//>`;
   }
 
@@ -202,7 +220,7 @@ function App() {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [lines, setLines] = useState(() => [
-    { kind: "hint", text: "claude-chat 跟看中。打字回车发消息（生成中也能打）；↑/↓ 翻历史；空行回车=打断这轮；Ctrl-C 中断/连按两次退出。" },
+    { kind: "hint", text: "claude-chat 跟看中。打字回车发消息（生成中也能打）；Shift+Enter 换行；↑/↓ 翻历史；空行回车=打断这轮；Ctrl-C 中断/连按两次退出。" },
     ...urlLines(),
   ]);
   const [live, setLive] = useState("");        // 正在流式的 AI 文本（未定格）
@@ -487,7 +505,24 @@ function App() {
   `;
 }
 
+// ── Kitty keyboard protocol：让终端把 Shift+Enter 和普通 Enter 区分开 ──
+// 不开这个，两者都发成 \r、Ink 读到的 key.shift 恒 false，Shift+Enter 就没法换行。
+// 开了之后 Shift+Enter 发 CSI 13;2u，Ink 交成 key.return && key.shift（已在 Input 里处理）。
+// 支持的终端（iTerm2 3.5+、Kitty、Ghostty、WezTerm）会生效；不支持的会忽略这串，功能自然降级成「Enter 发送」。
+// push（CSI>1u = disambiguate escape codes）进栈，退出时**必须**pop（CSI<u），否则协议残留会污染之后的终端会话。
+let kittyPopped = false;
+function popKitty() {
+  if (kittyPopped) return;                 // 幂等：多条退出路径都可能调到
+  kittyPopped = true;
+  try { process.stdout.write("\x1b[<u"); } catch {}
+}
+process.on("exit", popKitty);              // 任何退出路径（Ctrl-C 双击、后端已死、异常）兜底 pop
+
 // exitOnCtrlC:false —— 关掉 Ink 默认的「按一次 Ctrl-C 立刻退出」。
 // 否则 Ink 自己会在第一次 Ctrl-C 就退出，且 useInput 对 ctrl+c 直接跳过不回调，
 // 我们「先中断这轮、1.5s 内再按一次才全退」的逻辑根本收不到键。
 render(html`<${App} />`, { exitOnCtrlC: false });
+
+// push 放在 render 之后：等 Ink 接管终端（raw mode + 事件监听就绪）再开启协议，
+// 免得启动竞态把这串吃掉。
+process.stdout.write("\x1b[>1u");          // push：开启区分模式
