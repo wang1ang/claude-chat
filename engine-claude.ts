@@ -144,6 +144,19 @@ async function runPrompt(prompt: string, ctx: EngineRunContext): Promise<void> {
         return { behavior: "allow" as const, updatedInput: input };
       },
       includePartialMessages: true,               // token 级增量
+      // 追加指引（保留 claude_code 默认 prompt）：这是手机聊天场景，长命令会把对话卡住、
+      // 用户又打断不了正在跑的子进程。所以预计会久的命令默认丢后台，别阻塞对话。
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        append:
+          "运行环境：用户通过手机聊天界面跟你对话，无法用 Ctrl+B 把命令转后台，" +
+          "正在前台跑的长命令会一直卡住对话、用户也没法打断已在执行的子进程。" +
+          "因此，凡是预计运行会超过几秒的命令（如构建、测试、安装依赖、长时间下载、" +
+          "sleep、长轮询等），默认用 Bash 工具的 run_in_background: true 起，起完立刻" +
+          "继续对话，之后再用 BashOutput 回收输出。快速命令（git status、ls、读写文件等）" +
+          "照常前台跑，无需后台。",
+      },
       ...(ctx.model ? { model: ctx.model } : {}),
       cwd: ctx.cwd,
       abortController: abort,
