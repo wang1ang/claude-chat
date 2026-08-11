@@ -4,8 +4,6 @@
 // 用法（由 claude-chat 调用）：PORT=.. SECRET=.. [FULL_URL=..] [PID_FILE=..] node watch.mjs
 import { execSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
 import React, { useState, useEffect, useRef } from "react";
 import { render, Box, Text, Static, useApp, useInput, useStdout, useCursor } from "ink";
 import stringWidth from "string-width";
@@ -187,15 +185,23 @@ function shutdownAll() {
       if (pid) { try { process.kill(pid, "SIGTERM"); } catch {} }
     }
   } catch {}
-  // 2) 兜底按名清 server + 隧道。
-  // 为什么 server 还得按名兜：pid 文件里记的是 nohup 起的**顶层 npm exec** pid，
+  // 2) 兜底清 server + 隧道。
+  // 为什么 server 还得兜：pid 文件里记的是 nohup 起的**顶层 npm exec** pid，
   // 其下 npm→tsx→node(server.ts) 三层同属一个进程组，但 npm exec 未必把 SIGTERM
   // 转发给子进程——只杀顶层，真正 listen 的 node(server.ts) 可能变孤儿继续占端口。
   // 又不能按进程组杀：本 watch 进程和 server 同组（脚本 exec 成 watch），会自杀。
-  // 所以按**本仓库的 server.ts 绝对路径**兜——只命中本份，不会误伤别处装的另一实例
-  //（早先宽泛的 /claude-chat/server.ts 会连 ~/.local 那份一起杀，留别份隧道成孤儿→502）。
+  //
+  // 关键：server 必须按**本份端口**精确定位，不能按 server.ts 路径 pkill——
+  // 多份并存时所有份都是同一个仓库路径，`pkill -f .../server.ts` 会把**每一份**的
+  // server 一起杀掉（正是「关一份连别的后台也关了」的真凶）。改用 lsof 抓监听本份
+  // PORT 的那个进程：端口是每份唯一的，只命中本份，且直达真正 listen 的 node（绕开
+  // npm exec 不转发信号的坑）。
   const kill = (pat) => { try { execSync(`pkill -f ${JSON.stringify(pat)}`, { stdio: "ignore" }); } catch {} };
-  kill(`${dirname(fileURLToPath(import.meta.url))}/server.ts`);
+  try {
+    const pids = execSync(`lsof -ti tcp:${PORT} -sTCP:LISTEN`, { stdio: ["ignore", "pipe", "ignore"] })
+      .toString().split("\n").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+    for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+  } catch {}   // lsof 没命中（server 已退）会非零退出，忽略
   // 隧道两种后端都兜（哪种在跑就命中哪种，另一种匹配不到、无副作用）。都按**本份端口**精确匹配。
   // cloudflared：命令行带 --url http://127.0.0.1:<端口>，模式要和启动脚本一致（含 --protocol http2）。
   kill(`cloudflared tunnel --protocol http2 --url http://127.0.0.1:${PORT}`);
