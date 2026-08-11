@@ -430,6 +430,20 @@ conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSe
 // mode 由内容决定：server 端 interrupt 只掐断、不入队新文字。
 async function send() {
   const text = ta.value.trim();
+  // 若正挂着未回答的选框：打字发送=直接把这段文字当成对选框的回答（贴近真实 CLI），
+  // 空发送则忽略（别误触打断把选框那轮 abort 掉）。服务端 /send 也有同样的兜底。
+  const pendingAskEl = log.querySelector('.ask:not(.answered)');
+  if (pendingAskEl) {
+    ta.value = ''; ta.style.height = 'auto'; refreshBtn();
+    if (!text) return;   // 选框期空发送忽略
+    const id = pendingAskEl.dataset.askId;
+    pendingAskEl.classList.add('answered');   // 立即锁住选框；服务端会广播 ask_answered/user 回显
+    try {
+      await fetch(BASE + 'answer', { method:'POST', headers:{'content-type':'application/json'},
+        body: JSON.stringify({ id, picks: [[text]] }) });   // 自由文字回答
+    } catch { addBubble('status','⚠️ 发送失败'); }
+    return;
+  }
   const mode = text ? 'queue' : 'interrupt';
   ta.value = ''; ta.style.height = 'auto'; refreshBtn();
   try {

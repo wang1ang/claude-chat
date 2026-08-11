@@ -67,6 +67,23 @@ function askUser(questions: any[]): Promise<string[][]> {
   });
 }
 
+// 回答当前挂起的选框：picks 是 string[][]（每题选中的 label 数组；
+// 自由文字回答传 [[text]]，引擎那边 join 后就是原文）。回显+唤醒引擎。
+// 供 /answer（点选项）和 /send（选框期直接打字回答）共用。
+function answerAsk(id: string, picks: string[][]): boolean {
+  if (!pendingAsk) return false;
+  if (id && id !== pendingAsk.id) return false;   // 过期回答，忽略
+  const ask = pendingAsk;
+  pendingAsk = null;
+  const flat = picks.flat().filter(Boolean);
+  broadcast({ type: "ask_answered", id: ask.id, picks });
+  broadcast({ type: "user", text: "（已选）" + (flat.length ? flat.join("、") : "—") });
+  broadcast({ type: "status", text: "思考中…" });
+  if (process.env.CC_DEBUG) console.error(`[answer] ${ask.id} picks=${JSON.stringify(picks)}`);
+  ask.resolve(picks);   // 唤醒挂起的 ctx.ask（引擎据 picks 构造它自己要的 input）
+  return true;
+}
+
 // 取 seq 之后的所有事件（since=0 或负数=从头，含刚铺的历史）
 function eventsSince(since: number): Ev[] {
   if (since <= 0) return EVENTS.slice();
@@ -233,6 +250,13 @@ const server = createServer(async (req, res) => {
       text = String(text).trim();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      // 选框优先：正挂着待答的 AskUserQuestion 时，这条消息一律当成对它的回答，
+      // 不走排队/打断——堵住「消息卡在选框弹出前后被吞」的竞态。前端一般已在选框期
+      // 改走 /answer，这里是后端权威兜底（消息比选框事件早到、或前端判断没跟上时）。
+      if (pendingAsk) {
+        if (text) answerAsk(pendingAsk.id, [[text]]);   // 自由文字当回答
+        return;                                          // 空消息在选框期直接忽略，别误 abort 掉选框那轮
+      }
       // mode=interrupt：空白打断——掐断当前这轮 + 清空还没跑的排队，不发任何新内容。
       // mode=queue：有文字——贴近 CLI，永远排到当前轮后面，跑完自动接着处理，从不打断。
       if (mode === "interrupt") {
@@ -265,14 +289,7 @@ const server = createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, error: "问题已过期" }));
         return;
       }
-      const ask = pendingAsk;
-      pendingAsk = null;
-      const flat = picks.flat().filter(Boolean);
-      broadcast({ type: "ask_answered", id: ask.id, picks });
-      broadcast({ type: "user", text: "（已选）" + (flat.length ? flat.join("、") : "—") });
-      broadcast({ type: "status", text: "思考中…" });
-      if (process.env.CC_DEBUG) console.error(`[answer] ${ask.id} picks=${JSON.stringify(picks)}`);
-      ask.resolve(picks);   // 唤醒挂起的 ctx.ask（引擎据 picks 构造它自己要的 input）
+      answerAsk(id, picks);   // 回显 + 唤醒引擎（与 /send 选框兜底共用同一逻辑）
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     });
