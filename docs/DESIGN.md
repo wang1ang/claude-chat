@@ -104,6 +104,11 @@ claude-chat --model <model> <id>     # 指定模型（可选）
 Claude 在你电脑上读写文件、跑命令。隐藏路径暗号让网址难猜，但**拿到完整网址的人就能操作你的
 电脑**。切勿外泄网址。cloudflared quick tunnel 是公网可达的。生产用请自行加真正的鉴权。
 
+## 换/加后端引擎
+
+后端已按引擎解耦：`server.ts` 与具体后端无关，跟 Claude 绑定的代码收在 `engine-claude.ts`，
+通过 `engine.ts` 的 `Engine` 接口接入。想把后端换/加成 pi，见 [`docs/PI_ENGINE.md`](./PI_ENGINE.md)。
+
 ## 姊妹工具
 
 要完整掌控终端画面（而不是聊天框）用 `claude-web`（ttyd + cloudflared）；要手机上舒服聊天
