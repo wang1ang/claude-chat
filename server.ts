@@ -140,11 +140,6 @@ async function drainQueue() {
 // ---- 驱动一次 claude 调用，把事件翻译成聊天用的简单协议推给前端 ----
 // 注意：用户气泡的回显已挪到 enqueuePrompt（入队即显示），这里不再重复 broadcast user。
 async function runPrompt(prompt: string) {
-  if (running) {
-    // 理论上不会走到（drainQueue 保证串行），保险起见排队。
-    QUEUE.push(prompt);
-    return;
-  }
   running = true;
   // 用户气泡已在 enqueuePrompt 里回显过，这里只发"思考中"。
   broadcast({ type: "status", text: "思考中…" });
@@ -174,9 +169,6 @@ async function runPrompt(prompt: string) {
     if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
     // 只有 result 没发过 done 时（中断/报错/异常提前退出）才补一个，避免重复"✓ 完成"
     if (!sawDone) broadcast({ type: "done", subtype: "idle" });
-    // 兜底：这一轮结束后若队列里还有排队的消息，接着跑（正常情况下 drainQueue 的循环已经会接手，
-    // 这里再兜一次，防止某些边界下没人续上导致排队消息卡住）。
-    if (QUEUE.length) void drainQueue();
   }
 }
 
