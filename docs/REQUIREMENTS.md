@@ -162,6 +162,43 @@ Claude 绑定的代码收在 `engine-claude.ts`，通过 `engine.ts` 的 `Engine
 
 ---
 
+## 12. CLI 输入：Shift+Enter 换行、Enter 才发送
+
+**需求**：电脑端跟看的 TUI（`watch.mjs`）底部输入框，要能 **Shift+Enter 插换行、普通 Enter 发送**，
+跟手机网页端（`public/index.html` 桌面行为）和真实 Claude Code CLI 一致。
+
+**为什么这么实现**：终端默认把 Shift+Enter 和 Enter **都发成 `\r`**，程序区分不了。要区分
+必须开 **Kitty keyboard protocol**（iTerm2 3.5+/Kitty/Ghostty/WezTerm 支持）——开启后
+Shift+Enter 发 `CSI 13;2u`，Ink 7 把它解析成 `key.return && key.shift`。已在 iTerm2 3.6.11 实测。
+
+**怎么实现的**（`watch.mjs`）：
+- `render()` 之后 `process.stdout.write("\x1b[>1u")` push 协议；退出时 `\x1b[<u` pop，
+  挂在 `process.on("exit", popKitty)` 上、幂等，**任何退出路径都兜底 pop**。
+- `Input` 组件：`key.return && key.shift` → 在光标处插 `\n`（不提交）；`key.return` → 提交。
+- `Input` 支持多行：光标前文本按 `\n` 拆逻辑行，正确算真实光标 x/y（中文输入法候选框才跟手）。
+
+**别破坏**：
+- 退出时**必须** pop 协议（`\x1b[<u`），否则残留会污染之后的终端会话。
+- 不支持 Kitty 协议的终端会自动降级成「Enter 发送」（`key.shift` 恒 false），**这是可接受的降级，别报错**。
+
+---
+
+## 13. 关闭一份不能误杀别份的后台 ⭐已修的坑
+
+**坑**：多份 `claude-chat` 并存时（第 1 份、第 2 份…都在**同一个仓库路径**跑），关掉一份会把
+别份的后台 server 也一起杀掉。根因是 `shutdownAll()` 里按 `server.ts` **路径** `pkill -f`——
+同路径必然命中每一份的 server 进程。
+
+**怎么实现的**（`watch.mjs` 的 `shutdownAll()`）：server 兜底改用 **`lsof -ti tcp:<PORT> -sTCP:LISTEN`**
+按**本份端口**精确定位监听进程再 SIGTERM。端口每份唯一，只命中本份；且直达真正 `listen` 的
+node（顺带绕开「npm exec 不转发信号」的老坑）。隧道清理（cloudflared/ngrok）本就按本份 `PORT`
+精确匹配，无此问题。
+
+**别破坏**：**不要**再按 `server.ts` 路径 `pkill` 来清 server——多份并存必误伤。任何进程清理都要
+用**本份唯一标识**（端口 / 本份 PID_FILE），别用所有份共享的路径特征。
+
+---
+
 ## 附：本项目已确认「做不到 / 不做」的事（省得重复调研）
 
 - **把正在运行的命令转后台**：SDK stream-json 模式下无此能力（Ctrl+B 仅 TTY 模式、无 control 消息、
