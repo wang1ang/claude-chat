@@ -42,21 +42,21 @@ function broadcast(obj: any) {
   if (EVENTS.length > MAX_EVENTS) EVENTS.splice(0, EVENTS.length - MAX_EVENTS);
 }
 
-// 会话代次：每 startSession 一次 +1。硬中断（abort）时立刻 bump，让被作废那段会话
-// 之后还在排空的「迟到事件」（abort 后 SDK 流循环收尾时仍会吐几条）被丢弃，
+// 会话代次：每 startSession 一次 +1。打断（abort）时立刻 bump，让被作废那段会话
+// 之后还在收尾的「迟到事件」（打断后 SDK 流循环收尾时仍会吐几条）被丢弃，
 // 免得它们把 running 又翻回忙、或污染界面。
 let sessionGen = 0;
 
 // 引擎事件出口：捕获带 sessionId 的事件更新当前会话；据事件维护 running 忙闲；其余原样 broadcast。
 // done = agent 这一轮（含内部工具循环）到边界，置闲；任何生成中事件把它拉回忙。
-// gen 是发起这条事件的会话代次；跟当前不符（已被中断作废）就整条丢弃。
+// gen 是发起这条事件的会话代次；跟当前不符（已被打断作废）就整条丢弃。
 function engineEmit(gen: number, ev: any) {
   if (gen !== sessionGen) return;   // 迟到的作废会话事件，丢弃
   if (ev && typeof ev.sessionId === "string" && ev.sessionId) SESSION_ID = ev.sessionId;
   const t = ev?.type;
   if (t === "done") {
     running = false;
-    // 一轮结束时若还挂着没答的问题（中断/报错），清掉并让前端撤按钮，免得留个死按钮。
+    // 一轮结束时若还挂着没答的问题（打断/报错），清掉并让前端撤按钮，免得留个死按钮。
     if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
   } else if (t === "text_delta" || t === "tool_start" || t === "tool_use" || t === "ask") {
     running = true;   // 有生成活动 → 忙
@@ -151,7 +151,7 @@ let session: EngineSession | null = null;
 
 function ensureSession(): EngineSession {
   if (session) return session;
-  const gen = sessionGen;   // 绑定这段会话的代次；被中断 bump 后它的迟到事件会被 engineEmit 丢弃
+  const gen = sessionGen;   // 绑定这段会话的代次；被打断 bump 后它的迟到事件会被 engineEmit 丢弃
   session = engine.startSession({
     resumeSessionId: SESSION_ID,
     model: MODEL,
@@ -163,7 +163,7 @@ function ensureSession(): EngineSession {
   return session;
 }
 
-// 硬中断：作废当前会话（bump 代次丢弃其迟到事件）、掐断生成、清掉挂起的选框、置闲。
+// 打断：作废当前会话（bump 代次丢弃其迟到事件）、掐断生成、清掉挂起的选框、置闲。
 // 下条消息会懒起一个新的 resume 会话，接上历史继续。
 function abortSession() {
   if (session) session.abort();
@@ -175,15 +175,15 @@ function abortSession() {
 
 // 外部入口：发一条消息。
 // - 空闲时：直接 send，正常开一轮。
-// - 忙时（agent 在内部轮次里跑）：interrupt——把消息插进当前内部轮次的间隙（像真实 Claude），
-//   保留上下文、接着干，不丢弃在途工作。
+// - 忙时（agent 在内部轮次里跑）= 排队：把消息排进当前内部轮次（像真实 Claude），
+//   保留上下文、接着处理，不丢弃在途工作。底层用 SDK 的 interrupt() 实现（见 engine.ts）。
 function submitPrompt(text: string) {
   const busy = running && !!session;   // 先看当前忙闲（下面会置真）
   broadcast({ type: "user", text });   // 立刻回显用户气泡
-  broadcast({ type: "status", text: busy ? "插入到当前轮次…" : "思考中…" });
+  broadcast({ type: "status", text: busy ? "已排队到当前轮次…" : "思考中…" });
   const s = ensureSession();
   running = true;
-  if (busy) s.interrupt(text);   // 忙 → 插进内部轮次
+  if (busy) s.interrupt(text);   // 忙 → 排队进内部轮次
   else s.send(text);             // 闲 → 正常开一轮
 }
 
@@ -249,14 +249,14 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       // 选框优先：正挂着待答的 AskUserQuestion 时，这条消息一律当成对它的回答，
-      // 不走插入/打断——堵住「消息卡在选框弹出前后被吞」的竞态。前端一般已在选框期
+      // 不走排队/打断——堵住「消息卡在选框弹出前后被吞」的竞态。前端一般已在选框期
       // 改走 /answer，这里是后端权威兜底（消息比选框事件早到、或前端判断没跟上时）。
       if (pendingAsk) {
         if (text) answerAsk(pendingAsk.id, [[text]]);   // 自由文字当回答
         return;                                          // 空消息在选框期直接忽略，别误动选框那轮
       }
-      // mode=interrupt：空白发送 = 硬打断——掐断当前生成、丢弃在途工作（Ctrl-C 语义）。
-      // mode=queue：有文字——插进当前内部轮次的间隙（忙时）或正常开一轮（闲时），保留上下文。
+      // mode=interrupt：空白发送 = 打断——掐断当前生成、丢弃在途工作（Ctrl-C 语义）。
+      // mode=queue：有文字 = 排队——排进当前内部轮次（忙时）或正常开一轮（闲时），保留上下文。
       if (mode === "interrupt") {
         if (running && session) abortSession();
         return;
@@ -293,7 +293,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // 硬中断当前生成（Ctrl-C / 前端按钮触发）：掐断、丢弃在途工作。不关服务。
+  // 打断当前生成（Ctrl-C / 前端按钮触发）：掐断、丢弃在途工作。不关服务。
   // 会话句柄作废（下条消息会懒起一个新的 resume 会话，接上历史继续）。
   if (req.method === "POST" && path === "/interrupt") {
     const aborted = running && !!session;

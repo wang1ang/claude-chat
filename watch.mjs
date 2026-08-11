@@ -231,7 +231,7 @@ function App() {
   ]);
   const [live, setLive] = useState("");        // 正在流式的 AI 文本（未定格）
   const [input, setInput] = useState("");
-  const [status, setStatus] = useState("");    // 底部一行瞬时状态（思考中…/已中断…）
+  const [status, setStatus] = useState("");    // 底部一行瞬时状态（思考中…/已打断…）
 
   // 当前待回答的选择题；历史输入（上下键翻）；last Ctrl-C 时间
   const askRef = useRef(null);
@@ -396,7 +396,7 @@ function App() {
         return;
       }
       lastSigintRef.current = now;
-      setStatus("↯ 已请求中断当前生成（1.5秒内再按一次 Ctrl-C 退出并全关）");
+      setStatus("↯ 已请求打断当前生成（1.5秒内再按一次 Ctrl-C 退出并全关）");
       postInterrupt();
       return;
     }
@@ -437,7 +437,7 @@ function App() {
       postAnswer(id, picks).then((err) => { if (err) pushLine("err", "⚠️ 回答失败：" + err); });
       return;
     }
-    // 普通消息：有文字=排队插入并记进历史；空行=打断当前这轮
+    // 普通消息：有文字=排队（排进 agent 内部轮次）并记进历史；空行=打断当前这轮
     if (!text) { postSend("", "interrupt"); return; }
     historyRef.current = [...historyRef.current, text];
     postSend(text, "queue");

@@ -372,11 +372,11 @@ function handle(msg) {
 // 生成中不禁用发送按钮——像 CLI 那样随时插话。
 // 按钮文案同时兼当"忙闲指示"，让手机一眼看出 agent 说完没：
 //   空闲（这轮说完了）        → "发送"（不管输入框空不空）
-//   在跑 + 输入框有字         → "插入"（把消息插进 agent 当前内部轮次的间隙，像真实 Claude）
-//   在跑 + 输入框空           → "打断"（点了就硬掐断当前轮、丢弃在途工作）
+//   在跑 + 输入框有字         → "排队"（把消息排进 agent 当前内部轮次，保留上下文接着处理，像真实 Claude）
+//   在跑 + 输入框空           → "打断"（点了就掐断当前轮、丢弃在途工作）
 let busy = false;   // = agent 正在跑（服务端 running）。由 poll() 的 running 和事件共同维护。
 function setBusy(b) { busy = b; refreshBtn(); }
-function refreshBtn() { btn.textContent = !busy ? '发送' : (ta.value.trim() ? '插入' : '打断'); }
+function refreshBtn() { btn.textContent = !busy ? '发送' : (ta.value.trim() ? '排队' : '打断'); }
 
 // 关键：不靠"相对路径 + 尾斜杠"。手机地址栏可能吃掉末尾的 /，导致 EventSource('stream')
 // 掉了 /<secret> 前缀撞 404、SSE 根本连不上（发送成功但收不到回复）。
@@ -426,12 +426,12 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 // 电脑 CLI 后续写进 jsonl 的新内容，靠这个从头拉过来。
 conn.addEventListener('click', () => { conn.textContent = '刷新中…'; lastSeq = 0; log.innerHTML=''; aiBubble=null; statusEl=null; toolPending=[]; histBefore=null; histHasMore=true; histLoading=false; poll(); });
 
-// 有文字 = 插入到 agent 当前内部轮次的间隙（忙时）/ 正常开一轮（闲时），保留上下文不打断；
-// 空白（空/仅空格）= 硬打断当前轮、丢弃在途工作。mode 由内容决定，具体动作在 server 端。
+// 有文字 = 排队到 agent 当前内部轮次（忙时）/ 正常开一轮（闲时），保留上下文不打断；
+// 空白（空/仅空格）= 打断当前轮、丢弃在途工作。mode 由内容决定，具体动作在 server 端。
 async function send() {
   const text = ta.value.trim();
   // 若正挂着未回答的选框：打字发送=直接把这段文字当成对选框的回答（贴近真实 CLI），
-  // 空发送则忽略（别误触打断把选框那轮 abort 掉）。服务端 /send 也有同样的兜底。
+  // 空发送则忽略（别误触打断把选框那轮掐掉）。服务端 /send 也有同样的兜底。
   const pendingAskEl = log.querySelector('.ask:not(.answered)');
   if (pendingAskEl) {
     ta.value = ''; ta.style.height = 'auto'; refreshBtn();
@@ -448,7 +448,7 @@ async function send() {
   ta.value = ''; ta.style.height = 'auto'; refreshBtn();
   try {
     if (mode === 'queue') setBusy(true);
-    // 排队/打断由 server 按 mode 处理；用户气泡也由 server 回显（入队即显示）。
+    // 排队/打断由 server 按 mode 处理；用户气泡也由 server 回显（排队即显示）。
     await fetch(BASE + 'send', { method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ text, mode }) });
   } catch { setBusy(false); addBubble('status','⚠️ 发送失败'); }

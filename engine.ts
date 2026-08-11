@@ -6,7 +6,7 @@
 //   旧模型每条消息新起一次 query()（string prompt，单轮即关），插入的消息只能等整轮彻底
 //   跑完才处理。要做到「像真实 Claude 那样把消息插进 agent 的内部轮次里」，必须整段会话
 //   只开一次 query()、喂一个不结束的输入流（streaming input），server 随时往流里 push
-//   新消息；需要立刻插进当前内部轮次的间隙时，再调 interrupt()。
+//   新消息；需要把消息排进当前内部轮次时（忙时排队），再调 interrupt()。
 
 // 一段持续会话的上下文：引擎通过 emit 把中性事件吐给前端，通过 ask 挂起等手机作答。
 export interface EngineSessionContext {
@@ -26,21 +26,24 @@ export interface EngineSessionContext {
   debug: boolean;
 }
 
-// 引擎返回的会话句柄：server 用它往会话里喂消息 / 插队 / 结束。
+// 引擎返回的会话句柄：server 用它往会话里喂消息 / 排队 / 结束。
+// 术语：「排队」= 忙时把消息排进 agent 内部轮次（保留上下文接着处理）；
+//       「打断」= 掐断当前生成、丢弃在途工作（Ctrl-C 语义）。下面的方法名是实现手段。
 export interface EngineSession {
-  // 往会话里送一条用户消息。会排到当前内部轮次链的末尾，跑到边界时自然接上。
+  // 空闲时用：往会话里送一条用户消息，正常开一轮。
   send(text: string): void;
-  // 立刻把新消息插进当前内部轮次的间隙（像 CLI 那样）：在最近的内部轮次边界暂停、
+  // 忙时用（实现「排队」）：把新消息排进当前内部轮次——在最近的内部轮次边界暂停、
   // 保留上下文、把 text 作为新输入接上继续。不是把整轮生成掐死丢弃。
+  // （底层用 SDK query.interrupt() 在轮次边界插入，故沿用 interrupt 之名。）
   interrupt(text: string): void;
-  // 硬中断：掐断当前生成、丢弃在途内容（对应「空消息打断」/ Ctrl-C）。
+  // 实现「打断」：掐断当前生成、丢弃在途内容（对应「空消息发送」/ Ctrl-C）。
   abort(): void;
   // 关闭会话（结束输入流，让 query() 收尾）。
   close(): void;
 }
 
 export interface Engine {
-  // 开一段持续会话。事件通过 ctx.emit 实时吐出。返回可用来喂消息 / 插队的句柄。
+  // 开一段持续会话。事件通过 ctx.emit 实时吐出。返回可用来喂消息 / 排队 / 打断的句柄。
   startSession(ctx: EngineSessionContext): EngineSession;
   // 把会话历史（.jsonl 等）解析成可直接渲染的气泡事件序列。
   readHistory(sessionId: string, cwd: string): any[];

@@ -8,6 +8,20 @@
 
 ---
 
+## 统一术语（全项目一致，勿混用）
+
+发消息只有两个用户可见行为，全项目（UI 文案 / 注释 / 文档）统一用这两个词：
+
+| 术语 | 触发 | 含义 | 实现手段 |
+|---|---|---|---|
+| **排队** | 忙时发文字 | 消息**排进 agent 内部轮次**（排到当前内部轮次的间隙），保留上下文接着处理，像真实 Claude。**不是**排到整轮结束之后，也**不是**丢弃/抢占。 | `session.interrupt()` = push 进流 + SDK `query.interrupt()` |
+| **打断** | 空发送 / Ctrl-C | 掐断当前生成、丢弃在途工作。 | `session.abort()` → `abortSession()` |
+
+> 底层 SDK 的 `interrupt()` / `abort()` 是 API 名，代码里保留；但**用户可见的词只有「排队」和「打断」**。
+> 别再引入「插入 / 中断 / 硬打断」等同义词——那是历史遗留，已统一。
+
+---
+
 ## 0. 项目定位（不要偏离）
 
 手机聊天框接管本地 Claude Code 会话：**resume 一段对话历史、由自己的程序新起一个 Claude 来
@@ -16,42 +30,44 @@
 
 ---
 
-## 1. 消息要插入到 agent 的「内部轮次」，像真实 Claude ⭐核心
+## 1. 排队：消息排进 agent 的「内部轮次」，像真实 Claude ⭐核心
 
-**需求**：用户在手机上发消息，如果 agent 正忙（在多步工具循环里跑），这条消息要能**插进
-当前内部轮次的间隙**，agent 保留上下文、接着把新指令纳进来——就跟真实 Claude Code CLI 里
-你打字回车的体验一样。**不是**「排到整轮彻底跑完之后才处理」。
+**需求**：用户在手机上发消息，如果 agent 正忙（在多步工具循环里跑），这条消息要能**排进
+当前内部轮次**（排到内部轮次的间隙），agent 保留上下文、接着把新指令纳进来——就跟真实
+Claude Code CLI 里你打字回车的体验一样。这依然是**排队**，只是排进的是**内部轮次**，
+**不是**「排到整轮彻底跑完之后才处理」。
 
 **为什么**：这是用户明确、反复强调的核心诉求（「我要的就是排队到内部轮次里」）。旧实现每条
-消息新起一次 `query()`（string prompt，单轮即关），插入的消息只能等整轮跑完，体验差。
+消息新起一次 `query()`（string prompt，单轮即关），排队的消息只能等整轮跑完，体验差。
 
 **怎么实现的**（当前方案，勿退回旧的单轮模型）：
 - 整段会话**只开一次** `query()`，`prompt` 传一个**不结束的异步输入流**
   （`AsyncIterable<SDKUserMessage>`，见 `engine-claude.ts` 的 `InputStream`），会话存活期间绝不 `done`。
 - 引擎接口是 `startSession(ctx) → { send, interrupt, abort, close }`（`engine.ts`）：
   - **空闲发消息** = `send(text)`：往流里 push，正常开一轮。
-  - **忙时发消息** = `interrupt(text)`：push 进流 **+ 调 `query.interrupt()`**，SDK 在当前内部
-    轮次边界暂停、**保留上下文接上继续**。这是 CLI 语义，**不是**丢弃重来。
-  - **空发送** = `abort()`：硬中断，掐断当前生成、丢弃在途工作（Ctrl-C 语义）。
+  - **忙时发消息（排队）** = `interrupt(text)`：push 进流 **+ 调 `query.interrupt()`**，SDK 在当前
+    内部轮次边界暂停、**保留上下文接上继续**。这是 CLI 语义，**不是**丢弃重来。
+    （方法名沿用 SDK 的 `interrupt`，但它实现的用户行为是「排队」，不是「打断」。）
+  - **空发送（打断）** = `abort()`：掐断当前生成、丢弃在途工作（Ctrl-C 语义）。
 - `server.ts` 里 `submitPrompt()` 按 `running` 决定走 `send` 还是 `interrupt`；会话**懒起**
   （首条消息时 `ensureSession()`）。
 
 **别破坏**：
 - 不要改回「每条消息一个 `query()`」的单轮模型。
-- `interrupt()` ≠ 丢弃。它保留上下文接着干。别把它实现成 abort。
+- 「排队」(`interrupt()`) ≠ 丢弃。它保留上下文接着处理。别把它实现成 `abort()`（那是「打断」）。
 - 不能用 `bypassPermissions`——那样 SDK 跳过 `canUseTool`，就拦不到 AskUserQuestion 了（见 §5）。
 
 ---
 
-## 2. 中断后的「迟到事件」不能把状态翻回忙 ⭐已修的竞态
+## 2. 打断后的「迟到事件」不能把状态翻回忙 ⭐已修的竞态
 
-**需求/坑**：硬中断（abort）后，被作废那段会话的 SDK 流循环**收尾时仍会吐几条迟到事件**
+**需求/坑**：打断（abort）后，被作废那段会话的 SDK 流循环**收尾时仍会吐几条迟到事件**
 （text_delta / tool_use 等）。如果照单全收，会把 `running` 又翻回 `true`，界面显示还在忙。
 
 **怎么实现的**：`server.ts` 用**会话代次** `sessionGen`：每 `startSession` 绑定一个 gen，
 `abortSession()` 时 `sessionGen++`。`engineEmit(gen, ev)` 里 `gen !== sessionGen` 的事件**整条丢弃**。
 
-**别破坏**：改中断/会话生命周期逻辑时，务必保留这个代次门。已经真机验证过：abort 后 `running`
+**别破坏**：改打断/会话生命周期逻辑时，务必保留这个代次门。已经真机验证过：打断后 `running`
 稳定为 `false` 不回弹。
 
 ---
@@ -61,8 +77,7 @@
 - `running` = agent 当前是否在生成（含内部工具循环），**只是给前端看的忙闲指示**。
 - 由引擎事件驱动：`text_delta / tool_start / tool_use / ask` → 忙；`done` → 闲（见 `engineEmit`）。
 - 前端每秒 `poll()` 拿 `running` 校准按钮文案。
-- 前端发送按钮文案兼当忙闲指示：空闲=**「发送」**、忙+有字=**「插入」**、忙+空=**「打断」**。
-  （注意：「插入」不是旧的「排队」——语义已随 §1 改变，文案也改了。）
+- 前端发送按钮文案兼当忙闲指示：空闲=**「发送」**、忙+有字=**「排队」**、忙+空=**「打断」**。
 
 ---
 
@@ -100,7 +115,7 @@ SDK 期望 `updatedInput.answers` = `Record<问题文本, 答案字符串>`（�
 ## 6. 选框弹出前后发的消息不能被吞 ⭐已修的竞态
 
 **需求/坑**：用户发消息的时机如果**刚好卡在选框弹出前后**，消息会被忽略——空消息误触打断把
-选框那轮 abort 掉、文字消息被 askUser 的 Promise 堵住永不处理。
+选框那轮掐掉、文字消息被 askUser 的 Promise 堵住永不处理。
 
 **怎么实现的（已定行为）**：**发消息 = 自动把这段文字当成对选框的回答**。
 - 后端 `/send`：`pendingAsk` 存在时，有文字 → `answerAsk(id, [[text]])`；空消息 → 直接忽略
@@ -203,7 +218,7 @@ node（顺带绕开「npm exec 不转发信号」的老坑）。隧道清理（c
 
 - **把正在运行的命令转后台**：SDK stream-json 模式下无此能力（Ctrl+B 仅 TTY 模式、无 control 消息、
   server 拿不到 detached 子进程 PID）。只能靠 §4 的启动即后台。
-- **从 server 中断已启动的 bash 子进程**：`abort()` 只 SIGTERM 掉 CLI（CLI 再 tree-kill），
-  server 拿不到子进程 PID，做不到精准中断单个子进程。
-- **纯排队插入 agent 内部轮次而不 interrupt**：光 push 进流不调 `interrupt()` 的话，消息还是排到
-  当前工具循环之后——连真实 Claude Code 也是这样。要真插进内部轮次**必须** push + `interrupt()`（见 §1）。
+- **从 server 精准杀掉已启动的 bash 子进程**：`abort()` 只 SIGTERM 掉 CLI（CLI 再 tree-kill），
+  server 拿不到子进程 PID，做不到精准终止单个子进程。
+- **不调 `interrupt()` 就想把消息排进 agent 内部轮次**：光 push 进流不调 `interrupt()` 的话，消息还是排到
+  当前工具循环之后——连真实 Claude Code 也是这样。要真排进内部轮次（§1 的「排队」）**必须** push + `interrupt()`。

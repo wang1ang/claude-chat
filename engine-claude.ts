@@ -162,7 +162,8 @@ class InputStream {
 }
 
 // ---- 开一段持续会话：整段生命周期只调一次 query()，喂一个不结束的输入流 ----
-// send / interrupt 往流里 push 消息；interrupt 额外调 q.interrupt() 在内部轮次边界暂停接上。
+// send（空闲开一轮）/ interrupt（忙时排队进内部轮次）往流里 push 消息；
+// interrupt 额外调 q.interrupt() 在内部轮次边界暂停接上。abort 才是「打断」（掐断丢弃）。
 function startSession(ctx: EngineSessionContext): EngineSession {
   if (ctx.debug) console.error(`[startSession] resume=${ctx.resumeSessionId ?? "(新)"}`);
 
@@ -267,7 +268,7 @@ function startSession(ctx: EngineSessionContext): EngineSession {
         }
       }
     } catch (e: any) {
-      // abort 掉的属正常收尾（server 会另发"已中断"提示），其余算错误。
+      // abort 掉的属正常收尾（打断 = 正常路径，不算错误），其余算错误。
       if (!abort.signal.aborted) ctx.emit({ type: "error", message: String(e?.message ?? e) });
     } finally {
       // 流循环结束（close/abort/异常）：兜底发一个 done，免得前端卡在"思考中"。
@@ -280,9 +281,9 @@ function startSession(ctx: EngineSessionContext): EngineSession {
       input.enqueue(userMessage(text));
     },
     interrupt(text: string) {
-      // 把消息排进流，再请求在当前内部轮次边界暂停接上（像 CLI 那样插进内部轮次）。
+      // 实现「排队」：把消息排进流，再请求在当前内部轮次边界暂停接上（像 CLI 那样排进内部轮次）。
       input.enqueue(userMessage(text));
-      // q.interrupt() 是异步的；插队不需要等它完成，失败也不致命（消息已在流里排着）。
+      // q.interrupt() 是异步的；排队不需要等它完成，失败也不致命（消息已在流里排着）。
       void Promise.resolve(q.interrupt?.()).catch((e) => {
         if (ctx.debug) console.error(`[interrupt] ${String(e?.message ?? e)}`);
       });
