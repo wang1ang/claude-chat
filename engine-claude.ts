@@ -1,11 +1,13 @@
 // Claude 引擎：把 @anthropic-ai/claude-agent-sdk 的 query() 封装成 Engine 契约。
-// 这里的 runPrompt / readHistory / toolSummary / buildAskUpdatedInput 都是从原 server.ts
-// 原样搬过来的——行为不变，只是把「跟 Claude 绑死的部分」收拢到这一个文件。
+// 关键：整段会话只开一次 query()，喂一个「不结束的输入流」（streaming input）当 prompt，
+// server 随时往流里 push 新消息；需要把消息插进 agent 的内部轮次间隙时（像真实 Claude），
+// 就先 push 消息再调 query.interrupt()。readHistory / toolSummary / buildAskUpdatedInput
+// 与旧版一致。
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { Engine, EngineRunContext } from "./engine.ts";
+import type { Engine, EngineSession, EngineSessionContext } from "./engine.ts";
 
 // 把前端提交的答案拼进 AskUserQuestion 期望的 input 结构。
 // 关键：SDK 期望 updatedInput 顶层有个 answers 字段，类型是 Record<问题文本, 答案字符串>，
@@ -118,18 +120,58 @@ function readHistory(sessionId: string, cwd: string): any[] {
   return out;
 }
 
-// ---- 驱动一次 claude 调用，把事件翻译成聊天用的简单协议推给前端 ----
-async function runPrompt(prompt: string, ctx: EngineRunContext): Promise<void> {
-  if (ctx.debug) console.error(`[runPrompt] prompt=${JSON.stringify(prompt)} resume=${ctx.resumeSessionId ?? "(新)"}`);
+// 把一段文字包成 SDK 期望的流式输入消息（SDKUserMessage）。
+// session_id 留空由 SDK 填；parent_tool_use_id=null 表示这是顶层用户输入。
+function userMessage(text: string): any {
+  return {
+    type: "user",
+    session_id: "",
+    parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "text", text }] },
+  };
+}
 
-  // SDK 需要 AbortController；把 server 传来的中性 signal 转接成一个 controller。
+// 自建的「不结束的」异步输入流：query() 把它当 prompt 迭代。
+// enqueue(msg) 推一条；end() 结束（让 query 收尾）。会话存活期间绝不 end。
+// 照 SDK 内部 Stream 的写法：有等待队列时唤醒等待者，否则塞进缓冲。
+class InputStream {
+  private buffer: any[] = [];
+  private waiters: ((r: IteratorResult<any>) => void)[] = [];
+  private done = false;
+
+  enqueue(msg: any) {
+    if (this.done) return;
+    const w = this.waiters.shift();
+    if (w) w({ value: msg, done: false });
+    else this.buffer.push(msg);
+  }
+  end() {
+    this.done = true;
+    let w: ((r: IteratorResult<any>) => void) | undefined;
+    while ((w = this.waiters.shift())) w({ value: undefined, done: true });
+  }
+  [Symbol.asyncIterator]() {
+    return {
+      next: (): Promise<IteratorResult<any>> => {
+        if (this.buffer.length) return Promise.resolve({ value: this.buffer.shift(), done: false });
+        if (this.done) return Promise.resolve({ value: undefined, done: true });
+        return new Promise((resolve) => this.waiters.push(resolve));
+      },
+    };
+  }
+}
+
+// ---- 开一段持续会话：整段生命周期只调一次 query()，喂一个不结束的输入流 ----
+// send / interrupt 往流里 push 消息；interrupt 额外调 q.interrupt() 在内部轮次边界暂停接上。
+function startSession(ctx: EngineSessionContext): EngineSession {
+  if (ctx.debug) console.error(`[startSession] resume=${ctx.resumeSessionId ?? "(新)"}`);
+
+  const input = new InputStream();
   const abort = new AbortController();
-  if (ctx.signal.aborted) abort.abort();
-  else ctx.signal.addEventListener("abort", () => abort.abort());
+  let streamedText = false;   // 当前这轮有没有通过 stream_event 实时吐过文字
 
-  let streamedText = false;   // 这一轮有没有通过 stream_event 实时吐过文字
-  const iter = query({
-    prompt,
+  const q = query({
+    prompt: input as any,   // AsyncIterable<SDKUserMessage>：持续会话、不单轮
     options: {
       ...(ctx.resumeSessionId ? { resume: ctx.resumeSessionId } : {}),
       // 注意：不能再用 bypassPermissions——那样 SDK 会跳过 canUseTool 回调，
@@ -163,61 +205,95 @@ async function runPrompt(prompt: string, ctx: EngineRunContext): Promise<void> {
     },
   });
 
-  for await (const message of iter) {
-    if (ctx.debug) {
-      let d = "";
-      if (message.type === "assistant") d = JSON.stringify((message as any).message?.content)?.slice(0, 120);
-      else if (message.type === "result") d = (message as any).subtype;
-      console.error(`[msg] ${message.type}${(message as any).subtype ? "/" + (message as any).subtype : ""} ${d}`);
-    }
-    if (message.type === "system" && message.subtype === "init") {
-      // 会话 id 由 server 从这条 session 事件里捕获，后续接着聊。
-      ctx.emit({ type: "session", sessionId: message.session_id });
-
-    } else if (message.type === "stream_event") {
-      const ev: any = message.event;
-      // 工具开始的即时提示：stream 里 content_block_start 时 input 还是空的（参数随后才 delta 出来），
-      // 所以这里只发一个"工具开始"占位；完整参数由下面的 assistant 消息补齐成 tool_use 详情。
-      if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
-        // AskUserQuestion 不发工具占位——它由 canUseTool 拦下并广播成可交互的 ask 事件，
-        // 免得又冒一条 🔧 占位气泡跟提问按钮打架。
-        if (ev.content_block.name !== "AskUserQuestion") ctx.emit({ type: "tool_start", name: ev.content_block.name });
-      } else if (ev.type === "content_block_delta") {
-        if (ev.delta?.type === "text_delta") {
-          ctx.emit({ type: "text_delta", text: ev.delta.text });
-          streamedText = true;
+  // 后台把 query 的消息流翻译成聊天协议、emit 给前端。会话存活期间一直转。
+  (async () => {
+    try {
+      for await (const message of q) {
+        if (ctx.debug) {
+          let d = "";
+          if (message.type === "assistant") d = JSON.stringify((message as any).message?.content)?.slice(0, 120);
+          else if (message.type === "result") d = (message as any).subtype;
+          console.error(`[msg] ${message.type}${(message as any).subtype ? "/" + (message as any).subtype : ""} ${d}`);
         }
-        // input_json_delta（工具参数分片）不再逐片发——手机端拼不起来也没意义；
-        // 完整参数走 assistant 消息一次性发出。
-      } else if (ev.type === "content_block_stop") {
-        ctx.emit({ type: "block_stop" });
-      }
+        if (message.type === "system" && message.subtype === "init") {
+          // 会话 id 由 server 从这条 session 事件里捕获，后续接着聊。
+          ctx.emit({ type: "session", sessionId: message.session_id });
 
-    } else if (message.type === "assistant") {
-      // assistant 消息里 tool_use 块的 input 是**完整**的——无论走没走 token 流，
-      // 都从这里把工具的完整参数发出去（带一行人类可读摘要），手机才看得到"在干什么"。
-      const content: any = (message as any).message?.content;
-      if (Array.isArray(content)) {
-        for (const b of content) {
-          if (b?.type === "tool_use") {
-            // AskUserQuestion 跳过——已由 canUseTool 广播成交互式 ask 事件。
-            if (b.name !== "AskUserQuestion") ctx.emit({ type: "tool_use", name: b.name, summary: toolSummary(b.name, b.input), input: b.input ?? {} });
-          } else if (!streamedText && b?.type === "text" && b.text) {
-            // 兜底：这一轮没走 token 流（短回复/某些路径），从完整消息补发文字，
-            // 否则手机端会从"思考中"直接跳到"完成"、看不到回复。
-            ctx.emit({ type: "text_delta", text: b.text });
+        } else if (message.type === "stream_event") {
+          const ev: any = message.event;
+          // 工具开始的即时提示：stream 里 content_block_start 时 input 还是空的（参数随后才 delta 出来），
+          // 所以这里只发一个"工具开始"占位；完整参数由下面的 assistant 消息补齐成 tool_use 详情。
+          if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+            // AskUserQuestion 不发工具占位——它由 canUseTool 拦下并广播成可交互的 ask 事件，
+            // 免得又冒一条 🔧 占位气泡跟提问按钮打架。
+            if (ev.content_block.name !== "AskUserQuestion") ctx.emit({ type: "tool_start", name: ev.content_block.name });
+          } else if (ev.type === "content_block_delta") {
+            if (ev.delta?.type === "text_delta") {
+              ctx.emit({ type: "text_delta", text: ev.delta.text });
+              streamedText = true;
+            }
+            // input_json_delta（工具参数分片）不再逐片发——手机端拼不起来也没意义；
+            // 完整参数走 assistant 消息一次性发出。
+          } else if (ev.type === "content_block_stop") {
             ctx.emit({ type: "block_stop" });
           }
-        }
-      } else if (!streamedText && typeof content === "string" && content) {
-        ctx.emit({ type: "text_delta", text: content });
-        ctx.emit({ type: "block_stop" });
-      }
 
-    } else if (message.type === "result") {
-      ctx.emit({ type: "done", subtype: message.subtype, sessionId: message.session_id });
+        } else if (message.type === "assistant") {
+          // assistant 消息里 tool_use 块的 input 是**完整**的——无论走没走 token 流，
+          // 都从这里把工具的完整参数发出去（带一行人类可读摘要），手机才看得到"在干什么"。
+          const content: any = (message as any).message?.content;
+          if (Array.isArray(content)) {
+            for (const b of content) {
+              if (b?.type === "tool_use") {
+                // AskUserQuestion 跳过——已由 canUseTool 广播成交互式 ask 事件。
+                if (b.name !== "AskUserQuestion") ctx.emit({ type: "tool_use", name: b.name, summary: toolSummary(b.name, b.input), input: b.input ?? {} });
+              } else if (!streamedText && b?.type === "text" && b.text) {
+                // 兜底：这一轮没走 token 流（短回复/某些路径），从完整消息补发文字，
+                // 否则手机端会从"思考中"直接跳到"完成"、看不到回复。
+                ctx.emit({ type: "text_delta", text: b.text });
+                ctx.emit({ type: "block_stop" });
+              }
+            }
+          } else if (!streamedText && typeof content === "string" && content) {
+            ctx.emit({ type: "text_delta", text: content });
+            ctx.emit({ type: "block_stop" });
+          }
+
+        } else if (message.type === "result") {
+          // 一轮（含其内部多次工具循环）到边界了：发 done，让前端结束"思考中"、
+          // server 据此驱动忙闲状态。streamedText 归零，下一轮重新计。
+          streamedText = false;
+          ctx.emit({ type: "done", subtype: message.subtype, sessionId: message.session_id });
+        }
+      }
+    } catch (e: any) {
+      // abort 掉的属正常收尾（server 会另发"已中断"提示），其余算错误。
+      if (!abort.signal.aborted) ctx.emit({ type: "error", message: String(e?.message ?? e) });
+    } finally {
+      // 流循环结束（close/abort/异常）：兜底发一个 done，免得前端卡在"思考中"。
+      ctx.emit({ type: "done", subtype: "idle" });
     }
-  }
+  })();
+
+  return {
+    send(text: string) {
+      input.enqueue(userMessage(text));
+    },
+    interrupt(text: string) {
+      // 把消息排进流，再请求在当前内部轮次边界暂停接上（像 CLI 那样插进内部轮次）。
+      input.enqueue(userMessage(text));
+      // q.interrupt() 是异步的；插队不需要等它完成，失败也不致命（消息已在流里排着）。
+      void Promise.resolve(q.interrupt?.()).catch((e) => {
+        if (ctx.debug) console.error(`[interrupt] ${String(e?.message ?? e)}`);
+      });
+    },
+    abort() {
+      abort.abort();
+    },
+    close() {
+      input.end();
+    },
+  };
 }
 
-export const claudeEngine: Engine = { runPrompt, readHistory };
+export const claudeEngine: Engine = { startSession, readHistory };

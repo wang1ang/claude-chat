@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import type { Engine } from "./engine.ts";
+import type { Engine, EngineSession } from "./engine.ts";
 import { claudeEngine } from "./engine-claude.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -23,7 +23,9 @@ let SESSION_ID = process.env.SESSION_ID || undefined;
 const MODEL = process.env.MODEL || undefined;
 const CWD = process.env.CHAT_CWD || process.cwd();
 
-// 一次只允许一条 prompt 在跑（MVP：单会话、单飞行）。
+// running：agent 当前是否在生成（含内部工具循环）。由引擎的第一条消息置真、done 置假。
+// 跟旧版不同：不再「一条 prompt 一飞行」，而是一段持续会话里插消息进内部轮次，
+// running 只是给前端看的忙闲指示。
 let running = false;
 
 // ---- 事件缓冲：轮询模型（不用 SSE）----
@@ -40,9 +42,25 @@ function broadcast(obj: any) {
   if (EVENTS.length > MAX_EVENTS) EVENTS.splice(0, EVENTS.length - MAX_EVENTS);
 }
 
-// 引擎事件出口：捕获带 sessionId 的事件更新当前会话，其余原样 broadcast。
-function engineEmit(ev: any) {
+// 会话代次：每 startSession 一次 +1。硬中断（abort）时立刻 bump，让被作废那段会话
+// 之后还在排空的「迟到事件」（abort 后 SDK 流循环收尾时仍会吐几条）被丢弃，
+// 免得它们把 running 又翻回忙、或污染界面。
+let sessionGen = 0;
+
+// 引擎事件出口：捕获带 sessionId 的事件更新当前会话；据事件维护 running 忙闲；其余原样 broadcast。
+// done = agent 这一轮（含内部工具循环）到边界，置闲；任何生成中事件把它拉回忙。
+// gen 是发起这条事件的会话代次；跟当前不符（已被中断作废）就整条丢弃。
+function engineEmit(gen: number, ev: any) {
+  if (gen !== sessionGen) return;   // 迟到的作废会话事件，丢弃
   if (ev && typeof ev.sessionId === "string" && ev.sessionId) SESSION_ID = ev.sessionId;
+  const t = ev?.type;
+  if (t === "done") {
+    running = false;
+    // 一轮结束时若还挂着没答的问题（中断/报错），清掉并让前端撤按钮，免得留个死按钮。
+    if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
+  } else if (t === "text_delta" || t === "tool_start" || t === "tool_use" || t === "ask") {
+    running = true;   // 有生成活动 → 忙
+  }
   broadcast(ev);
 }
 
@@ -126,67 +144,47 @@ function olderHistory(beforeArg: number | null) {
   return { events, hasMore: start > 0, before: start };
 }
 
-// ---- 驱动一次引擎调用（中性驱动器）----
-// 事件翻译、历史解析、AskUserQuestion 的 input 拼装都在引擎里；这里只管调度。
-// 当前飞行中的中断器（Ctrl-C / 前端调 /interrupt 时用它掐断 claude 这一轮生成）
-let currentAbort: AbortController | null = null;
+// ---- 持续会话驱动器 ----
+// 事件翻译、历史解析、AskUserQuestion 的 input 拼装、流式输入 / interrupt 都在引擎里；
+// 这里整段会话只 startSession 一次（首条消息时懒起），之后所有消息都往这个句柄里喂。
+let session: EngineSession | null = null;
 
-// 待处理队列：贴近 CLI 体验——生成中再发不打断当前轮，而是排队，等这轮跑完自动接着发。
-const QUEUE: string[] = [];
-
-// 外部入口：发一条消息。running 时排队（默认），否则立刻跑。
-function enqueuePrompt(text: string) {
-  QUEUE.push(text);
-  broadcast({ type: "user", text });                 // 立刻回显用户气泡
-  if (running) {
-    broadcast({ type: "status", text: "已排队，等当前这轮完成后处理…" });
-  } else {
-    void drainQueue();
-  }
+function ensureSession(): EngineSession {
+  if (session) return session;
+  const gen = sessionGen;   // 绑定这段会话的代次；被中断 bump 后它的迟到事件会被 engineEmit 丢弃
+  session = engine.startSession({
+    resumeSessionId: SESSION_ID,
+    model: MODEL,
+    cwd: CWD,
+    emit: (ev: any) => engineEmit(gen, ev),
+    ask: askUser,
+    debug: !!process.env.CC_DEBUG,
+  });
+  return session;
 }
 
-// 依次把队列跑干净。runPrompt 结束后会再调一次，接着处理下一条。
-async function drainQueue() {
-  if (running) return;
-  const next = QUEUE.shift();
-  if (next === undefined) return;
-  await runPrompt(next);
-  if (QUEUE.length) void drainQueue();
+// 硬中断：作废当前会话（bump 代次丢弃其迟到事件）、掐断生成、清掉挂起的选框、置闲。
+// 下条消息会懒起一个新的 resume 会话，接上历史继续。
+function abortSession() {
+  if (session) session.abort();
+  session = null;
+  sessionGen++;   // 作废：之前那段会话之后 emit 的事件全丢
+  running = false;
+  if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
 }
 
-// ---- 驱动一次 claude 调用，把事件翻译成聊天用的简单协议推给前端 ----
-// 注意：用户气泡的回显已挪到 enqueuePrompt（入队即显示），这里不再重复 broadcast user。
-async function runPrompt(prompt: string) {
+// 外部入口：发一条消息。
+// - 空闲时：直接 send，正常开一轮。
+// - 忙时（agent 在内部轮次里跑）：interrupt——把消息插进当前内部轮次的间隙（像真实 Claude），
+//   保留上下文、接着干，不丢弃在途工作。
+function submitPrompt(text: string) {
+  const busy = running && !!session;   // 先看当前忙闲（下面会置真）
+  broadcast({ type: "user", text });   // 立刻回显用户气泡
+  broadcast({ type: "status", text: busy ? "插入到当前轮次…" : "思考中…" });
+  const s = ensureSession();
   running = true;
-  // 用户气泡已在 enqueuePrompt 里回显过，这里只发"思考中"。
-  broadcast({ type: "status", text: "思考中…" });
-
-  const abort = new AbortController();
-  currentAbort = abort;
-  let sawDone = false;   // 引擎是否发过 done（避免 finally 重复发）
-  const emit = (ev: any) => { if (ev?.type === "done") sawDone = true; engineEmit(ev); };
-  try {
-    await engine.runPrompt(prompt, {
-      resumeSessionId: SESSION_ID,
-      model: MODEL,
-      cwd: CWD,
-      signal: abort.signal,
-      emit,
-      ask: askUser,
-      debug: !!process.env.CC_DEBUG,
-    });
-  } catch (e: any) {
-    // 主动中断（abort）不算错误，给个中性提示
-    if (abort.signal.aborted) broadcast({ type: "status", text: "已中断这一轮。" });
-    else broadcast({ type: "error", message: String(e?.message ?? e) });
-  } finally {
-    running = false;
-    if (currentAbort === abort) currentAbort = null;
-    // 这一轮结束时若还挂着没答的问题（中断/报错），清掉并让前端撤下按钮，免得留个死按钮。
-    if (pendingAsk) { broadcast({ type: "ask_clear", id: pendingAsk.id }); pendingAsk = null; }
-    // 只有 result 没发过 done 时（中断/报错/异常提前退出）才补一个，避免重复"✓ 完成"
-    if (!sawDone) broadcast({ type: "done", subtype: "idle" });
-  }
+  if (busy) s.interrupt(text);   // 忙 → 插进内部轮次
+  else s.send(text);             // 闲 → 正常开一轮
 }
 
 // ---- HTTP：静态首页 + SSE 流 + 发消息 ----
@@ -251,21 +249,20 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       // 选框优先：正挂着待答的 AskUserQuestion 时，这条消息一律当成对它的回答，
-      // 不走排队/打断——堵住「消息卡在选框弹出前后被吞」的竞态。前端一般已在选框期
+      // 不走插入/打断——堵住「消息卡在选框弹出前后被吞」的竞态。前端一般已在选框期
       // 改走 /answer，这里是后端权威兜底（消息比选框事件早到、或前端判断没跟上时）。
       if (pendingAsk) {
         if (text) answerAsk(pendingAsk.id, [[text]]);   // 自由文字当回答
-        return;                                          // 空消息在选框期直接忽略，别误 abort 掉选框那轮
+        return;                                          // 空消息在选框期直接忽略，别误动选框那轮
       }
-      // mode=interrupt：空白打断——掐断当前这轮 + 清空还没跑的排队，不发任何新内容。
-      // mode=queue：有文字——贴近 CLI，永远排到当前轮后面，跑完自动接着处理，从不打断。
+      // mode=interrupt：空白发送 = 硬打断——掐断当前生成、丢弃在途工作（Ctrl-C 语义）。
+      // mode=queue：有文字——插进当前内部轮次的间隙（忙时）或正常开一轮（闲时），保留上下文。
       if (mode === "interrupt") {
-        QUEUE.length = 0;
-        if (running && currentAbort) currentAbort.abort();
+        if (running && session) abortSession();
         return;
       }
       if (!text) return;
-      enqueuePrompt(text);
+      submitPrompt(text);
     });
     return;
   }
@@ -296,11 +293,13 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // 中断当前这一轮生成（Ctrl-C / 前端按钮触发）。不关服务。
+  // 硬中断当前生成（Ctrl-C / 前端按钮触发）：掐断、丢弃在途工作。不关服务。
+  // 会话句柄作废（下条消息会懒起一个新的 resume 会话，接上历史继续）。
   if (req.method === "POST" && path === "/interrupt") {
-    if (currentAbort && running) currentAbort.abort();
+    const aborted = running && !!session;
+    if (aborted) abortSession();
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, aborted: !!(currentAbort && running) }));
+    res.end(JSON.stringify({ ok: true, aborted }));
     return;
   }
 
